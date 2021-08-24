@@ -42,6 +42,47 @@ http_get ()
     fi
 }
 
+ln_deps_install ()
+{
+    ln_deb_deps=( \
+        'autoconf' \
+        'automake' \
+        'build-essential' \
+        'git' \
+        'libtool' \
+        'libgmp-dev' \
+        'libsqlite3-dev' \
+        'python3-mako' \
+        'net-tools' \
+        'zlib1g-dev' \
+        'libsodium-dev' \
+        'gettext' )
+
+    ln_dar_deps=( \
+        'autoconf' \
+        'automake' \
+        'libtool' \
+        'python3' \
+        'gmp' \
+        'gnu-sed' \
+        'gettext' \
+        'libsodium' )
+
+    if [[ ${use_os_deps_check} != '1' ]]; then
+        echo "Checking OS package manager's dependencies disabled. Trying to build."
+        return 0
+    elif [[ ${install_os} == 'debian' ]]; then
+        deb_deps_install "${ln_deb_deps[@]}"
+        return "$?"
+    elif [[ ${install_os} == 'darwin' ]]; then
+        dar_deps_install "${ln_dar_deps[@]}"
+        return "$?"
+    else
+        echo "OS can not be determined. Trying to build."
+        return 0
+    fi
+}
+
 deps_install ()
 {
     debian_deps=( \
@@ -53,14 +94,16 @@ deps_install ()
         'python3-dev' \
         'python3-pip' \
         'python3-setuptools' \
-        'libltdl-dev' )
+        'libltdl-dev' \
+        'unzip' )
 
     if [ "$with_jmvenv" == 1 ]; then debian_deps+=("virtualenv"); fi
     if [ "$with_sudo" == 1 ]; then debian_deps+=("sudo"); fi
 
     darwin_deps=( \
         'automake' \
-        'libtool' )
+        'libtool' \
+        'unzip' )
 
     if ! is_python3; then
         echo "Python 2 is no longer supported. Please use a compatible Python 3 version."
@@ -156,6 +199,9 @@ venv_setup ()
     source "${jm_source}/jmvenv/bin/activate" || return 1
     pip install --upgrade pip
     pip install --upgrade setuptools
+    pip install mako
+    pip install mrkd
+    pip install mistune==0.8.4
     deactivate
 }
 
@@ -170,7 +216,11 @@ dep_get ()
     if ! sha256_verify "${pkg_hash}" "${pkg_name}"; then
         return 1
     fi
-    tar -xzf "${pkg_name}" -C ../
+    if [[ $1 == *zip ]]; then
+        unzip -o "${pkg_name}" -d ../
+    else
+        tar -xzf "${pkg_name}" -C ../
+    fi
     popd
 }
 
@@ -281,6 +331,36 @@ libsecp256k1_install()
     pushd "secp256k1-${secp256k1_lib_tar}"
     if libsecp256k1_build; then
         $make install
+    else
+        return 1
+    fi
+    popd
+}
+
+clightning_build ()
+{
+    PG_CONFIG="" ./configure \
+        --enable-developer \
+        --enable-experimental-features \
+        --prefix="${jm_root}"
+    $make
+}
+
+clightning_install ()
+{
+    # note: the normal tarball source is broken and must not be used according to:
+    # https://github.com/ElementsProject/lightning/issues/3900#issuecomment-668330656
+    # we use links like:
+    # https://github.com/ElementsProject/lightning/releases/download/v0.10.2/clightning-v0.10.2.zip
+    clightning_version='clightning-v0.10.2'
+    clightning_lib_sha="3c9dcb686217b2efe0e988e90b95777c4591e3335e259e01a94af87e0bf01809"
+    clightning_lib_url='https://github.com/ElementsProject/lightning/releases/download/v0.10.2'
+    if ! dep_get "${clightning_version}.zip" "${clightning_lib_sha}" "${clightning_lib_url}"; then
+        return 1
+    fi
+    pushd "${clightning_version}"
+    if clightning_build; then
+        PREFIX=. $make install
     else
         return 1
     fi
@@ -403,6 +483,7 @@ Options:
 --disable-secp-check        do not run libsecp256k1 tests (default is to run them)
 --docker-install            system wide install as root for minimal Docker installs
 --python, -p                python version (only python3 versions are supported)
+--with-ln-messaging     build and use c-lightning for message channels
 --with-qt                   build the Qt GUI
 --without-qt                don't build the Qt GUI
 "
@@ -418,6 +499,19 @@ Options:
         Install Qt dependencies (~160mb) ? [y|n] : "
         if [[ ${REPLY} =~ y|Y ]]; then
             with_qt='1'
+        fi
+    fi
+    if [[ ${with_ln_messaging} ]]; then
+        read -p "
+        INFO: Installing c-lightning is not needed
+        if you already have your own c-lightning node,
+        accessible over RPC. Are you sure you want to
+        build and install a bundled copy of c-lightning
+        in Joinmarket? [y|n]: "
+        if [[ ${REPLY} =~ y|Y ]]; then
+            with_ln_messaging='1'
+        else
+            with_ln_messaging='0'
         fi
     fi
 }
@@ -495,8 +589,19 @@ main ()
         fi
         source "${jm_root}/bin/activate"
     fi
+        if ! ln_deps_install; then
+            echo "Lightning dependencies could not be installed. Exiting."
+            return 1
+        fi
+    fi
     mkdir -p "deps/cache"
     pushd deps
+    if [[ ${with_ln_messaging} == "1" ]]; then
+        if ! clightning_install; then
+            echo "c-lightning was required, but not built. Exiting."
+            return 1
+        fi
+    fi
     if ! libsecp256k1_install; then
         echo "libsecp256k1 was not built. Exiting."
         return 1

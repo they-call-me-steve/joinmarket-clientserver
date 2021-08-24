@@ -4,6 +4,11 @@ import logging
 import os
 import re
 import sys
+import subprocess
+import atexit
+import copy
+import shutil
+from signal import SIGINT
 
 from configparser import ConfigParser, NoOptionError
 
@@ -140,6 +145,9 @@ rpc_wallet_file =
 ## SERVER 1/4) Darkscience IRC (Tor, IP)
 ################################################################################
 [MESSAGING:server1]
+# by default the legacy format without a `type` field is
+# understood to be IRC, but you can, optionally, add it:
+# type = irc
 channel = joinmarket-pit
 port = 6697
 usessl = true
@@ -154,43 +162,71 @@ socks5 = false
 #socks5_host = localhost
 #socks5_port = 9050
 
+[MESSAGING:lightning1]
+# c-lightning based message channels must have the exact type 'ln-onion'
+# (while the section name above can be MESSAGING:whatever), and there must
+# be only ONE such message channel configured (note the directory servers
+# can be multiple, below):
+type = ln-onion
+
+# Setting this to any value apart from the default, 'bundled':
+# This indicates to Joinmarket that the c-lightning executable is
+# already running on your machine and we instead use the contents
+# of this variable as the location of the RPC socket file for lightning.
+# By default it is found in ~/.lightning/[network]/lightning-rpc,
+# where [network] is one of bitcoin, signet, testnet, regtest.
+# Be sure to read the documentation at docs/lightning-message-channels.md
+# to find out how to run the Joinmarket plugin jmcl.py inside your c-lightning instance,
+# and configure the correct "TCP passthrough port" for it (see `passthrough-port` below).
+clightning-location = bundled
+# or (check your user has access rights):
+# clightning-location = /home/username/.lightning/bitcoin/lightning-rpc
+
+# This is a comma separated list (comma can be omitted if only one item).
+# Each item has format pubkey@host:port ; all are required. Host can be
+# a *.onion address (tor v3 only).
+directory-nodes = 033e65b76c4a3c0b907fddbc57822dbff1cf7ce48d341b8cfaf11bd324ea2d433d@45ojrjlrl2wh6yrnihlb2kl6k752sonptt2rpuv4shbob7ubxkdcmdqd.onion:9736
+# The port via which we receive data from the c-lightning plugin; if not bundled,
+# make sure it matches what you set in the jmcl.py plugin:
+passthrough-port = 49100
+# this is the port serving lightning on your onion service, bundled or otherwise:
+lightning-port = 9735
+
+# other IRC servers are commented out by default:
+
 ## SERVER 2/4) hackint IRC (Tor, IP)
 ################################################################################
-[MESSAGING:server2]
-channel = joinmarket-pit
-
-# For traditional IP (default):
-host = irc.hackint.org
-port = 6697
-usessl = true
-socks5 = false
-
-# For Tor (recommended as clearnet alternative):
-#host = ncwkrwxpq2ikcngxq3dy2xctuheniggtqeibvgofixpzvrwpa77tozqd.onion
-#port = 6667
-#usessl = false
-#socks5 = true
-#socks5_host = localhost
-#socks5_port = 9050
+#[MESSAGING:server2]
+#channel = joinmarket-pit
+## for traditional IP (default):
+#host = irc.hackint.org
+#port = 6697
+#usessl = true
+#socks5 = false
+## for Tor (recommended as clearnet alternative):
+##host = ncwkrwxpq2ikcngxq3dy2xctuheniggtqeibvgofixpzvrwpa77tozqd.onion
+##port = 6667
+##usessl = false
+##socks5 = true
+##socks5_host = localhost
+##socks5_port = 9050
 
 ## SERVER 3/4) Anarplex IRC (Tor, IP)
 ################################################################################
-[MESSAGING:server3]
-channel = joinmarket-pit
-
-# For traditional IP (default):
-host = agora.anarplex.net
-port = 14716
-usessl = true
-socks5 = false
-
-# For Tor (recommended as clearnet alternative):
-#host = vxecvd6lc4giwtasjhgbrr3eop6pzq6i5rveracktioneunalgqlwfad.onion
-#port = 6667
-#usessl = false
-#socks5 = true
-#socks5_host = localhost
-#socks5_port = 9050
+#[MESSAGING:server3]
+#channel = joinmarket-pit
+## for traditional IP (default):
+#host = agora.anarplex.net
+#port = 14716
+#usessl = true
+#socks5 = false
+## for Tor (recommended as clearnet alternative):
+##host = vxecvd6lc4giwtasjhgbrr3eop6pzq6i5rveracktioneunalgqlwfad.onion
+##port = 6667
+##usessl = false
+##socks5 = true
+##socks5_host = localhost
+##socks5_port = 9050
 
 ## SERVER 4/4) ILITA IRC (Tor - disabled by default)
 ################################################################################
@@ -497,7 +533,7 @@ def set_config(cfg, bcint=None):
         global_singleton.bc_interface = bcint
 
 
-def get_irc_mchannels():
+def get_mchannels():
     SECTION_NAME = 'MESSAGING'
     # FIXME: remove in future release
     if jm_single().config.has_section(SECTION_NAME):
@@ -508,16 +544,29 @@ def get_irc_mchannels():
         return _get_irc_mchannels_old()
 
     SECTION_NAME += ':'
-    irc_sections = []
+    sections = []
     for s in jm_single().config.sections():
         if s.startswith(SECTION_NAME):
-            irc_sections.append(s)
-    assert irc_sections
+            sections.append(s)
+    assert sections
 
-    req_fields = [("host", str), ("port", int), ("channel", str), ("usessl", str)]
+    irc_fields = [("host", str), ("port", int), ("channel", str), ("usessl", str),
+              ("socks5", str), ("socks5_host", str), ("socks5_port", str)]
+    lightning_fields = [("type", str), ("directory-nodes", str),
+                        ("passthrough-port", int), ("lightning-rpc", str),
+                        ("lightning-hostname", str), ("lightning-port", int),
+                        ("clightning-location", str), ("regtest-count", str)]
 
     configs = []
-    for section in irc_sections:
+
+    # processing the IRC sections:
+    for section in sections:
+        if jm_single().config.has_option(section, "type"):
+            # legacy IRC configs do not have "type" but just
+            # in case, we'll allow the "irc" type:
+            if not jm_single().config.get(section, "type").lower(
+                ) == "irc":
+                break
         server_data = {}
 
         # check if socks5 is enabled for tor and load relevant config if so
@@ -529,13 +578,30 @@ def get_irc_mchannels():
             server_data["socks5_host"] = jm_single().config.get(section, "socks5_host")
             server_data["socks5_port"] = jm_single().config.get(section, "socks5_port")
 
-        for option, otype in req_fields:
+        for option, otype in irc_fields:
             val = jm_single().config.get(section, option)
             server_data[option] = otype(val)
         server_data['btcnet'] = get_network()
         configs.append(server_data)
-    return configs
 
+    # processing the lightning sections:
+    for section in sections:
+        if not jm_single().config.has_option(section, "type") or \
+        not jm_single().config.get(section, "type").lower() == "ln-onion":
+            continue
+        ln_data = {}
+        for option, otype in lightning_fields:
+            try:
+                val = jm_single().config.get(section, option)
+            except NoOptionError:
+                continue
+            ln_data[option] = otype(val)
+        ln_data['btcnet'] = get_network()
+        # Just to allow a dynamic set of var:
+        ln_data["section-name"] = section
+        configs.append(ln_data)
+
+    return configs
 
 def _get_irc_mchannels_old():
     fields = [("host", str), ("port", int), ("channel", str), ("usessl", str),
@@ -623,7 +689,8 @@ def remove_unwanted_default_settings(config):
         if section.startswith('MESSAGING:'):
             config.remove_section(section)
 
-def load_program_config(config_path="", bs=None, plugin_services=[]):
+def load_program_config(config_path="", bs=None, plugin_services=[],
+                        ln_backend_needed=False):
     global_singleton.config.readfp(io.StringIO(defaultconfig))
     if not config_path:
         config_path = lookup_appdata_folder(global_singleton.APPNAME)
@@ -663,28 +730,6 @@ def load_program_config(config_path="", bs=None, plugin_services=[]):
         jmprint("Created a new `joinmarket.cfg`. Please review and adopt the "
               "settings and restart joinmarket.", "info")
         sys.exit(EXIT_FAILURE)
-
-    #These are left as sanity checks but currently impossible
-    #since any edits are overlays to the default, these sections/options will
-    #always exist.
-    # FIXME: This check is a best-effort attempt. Certain incorrect section
-    # names can pass and so can non-first invalid sections.
-    for s in required_options: #pragma: no cover
-        # check for sections
-        avail = None
-        if not global_singleton.config.has_section(s):
-            for avail in global_singleton.config.sections():
-                if avail.startswith(s):
-                    break
-            else:
-                raise Exception(
-                    "Config file does not contain the required section: " + s)
-        # then check for specific options
-        k = avail or s
-        for o in required_options[s]:
-            if not global_singleton.config.has_option(k, o):
-                raise Exception("Config file does not contain the required "
-                                "option '{}' in section '{}'.".format(o, k))
 
     loglevel = global_singleton.config.get("LOGGING", "console_log_level")
     try:
@@ -748,6 +793,122 @@ def load_program_config(config_path="", bs=None, plugin_services=[]):
             if not os.path.exists(plogsdir):
                 os.makedirs(plogsdir)
             p.set_log_dir(plogsdir)
+    # Check if a ln-onion message channel was configured:
+    chans = get_mchannels()
+    lnchans = [x for x in chans if "type" in x and x["type"] == "ln-onion"]
+    # only 1; multiple directories will be in this config section:
+    assert len(lnchans) < 2
+    # The additional flag 'ln_backend_needed' exists to address
+    # the case of a user with Lightning configured, but doing a non-interactive
+    # operation; in this case, starting the Lightning backend is pointless.
+    if lnchans and ln_backend_needed:
+        lnchanconfig = lnchans[0]
+        if lnchanconfig["clightning-location"] == "bundled":
+            # The creation of a datadir and the startup of the daemon
+            # are considered not-needed if you are not running the bundled
+            # copy of c-lightning; you should have read the docs and set it up
+            # yourself otherwise (see the config comments).
+            # First, we dynamically update this LN message chan
+            # config section to include the location on which its
+            # RPC socket will exist:
+            if global_singleton.config.get("BLOCKCHAIN", "blockchain_source") == "regtest":
+                brpc_net = "regtest"
+            else:
+                brpc_net = get_network()
+            if brpc_net == "regtest":
+                # We're going to create a separate data sub-directory for each lightning
+                # instance we setup.
+                start_num_instances, end_num_instances = [int(x) for x in lnchanconfig[
+                    "regtest-count"].split(",")]
+                # special case for manual regtest testing: if we
+                jmprint("Running {} regtest instances".format(
+                    end_num_instances - start_num_instances + 1))
+                # set the non-conflicting data location, then the ports/rpc:
+                for i in range(start_num_instances, end_num_instances + 1):
+                    jm_ln_dir = os.path.join(global_singleton.datadir,
+                                        "lightning-regtest" + str(i))
+                    jm_ln_dir = os.path.abspath(jm_ln_dir)
+                    if not os.path.exists(jm_ln_dir):
+                        os.makedirs(jm_ln_dir)
+                    # we cannot restart Lightning instances with old chain state,
+                    # because c-lightning will complain about time warp:
+                    path_to_lightning_regtest_data = os.path.join(jm_ln_dir, "regtest")
+                    if os.path.exists(path_to_lightning_regtest_data):
+                        shutil.rmtree(path_to_lightning_regtest_data)
+                    temp_config = copy.deepcopy(lnchanconfig)
+                    temp_config["passthrough-port"] = 49100 + i
+                    temp_config["lightning-port"] = 9735 + i
+                    start_ln(temp_config, jm_ln_dir, brpc_net, last_digit=i)
+            else:
+                jm_ln_dir = os.path.join(global_singleton.datadir, "lightning")
+                jm_ln_dir = os.path.abspath(jm_ln_dir)
+                if not os.path.exists(jm_ln_dir):
+                    os.makedirs(jm_ln_dir)
+                start_ln(lnchanconfig, jm_ln_dir, brpc_net)
+        else:
+            # we still need to set the location of the RPC to instantiate
+            # our LightningRpc object:
+            global_singleton.config.set(lnchanconfig["section-name"],
+                    "lightning-rpc", lnchanconfig["clightning-location"])
+
+def start_ln(chaninfo, jm_ln_dir, brpc_net, last_digit=-1):
+    """ If a LN message channel is configured with the
+    # "bundled" setting, we start the packaged/customised
+    # lightning daemon with the required ports
+    # in the background at the startup of each script.
+    """
+    global_singleton.config.set(chaninfo["section-name"], "lightning-rpc",
+                    os.path.join(jm_ln_dir, brpc_net, "lightning-rpc"))
+
+    passthrough_port = str(chaninfo["passthrough-port"])
+    # find where our custom lightningd is:
+    lightningd_loc = os.path.join(sys.prefix, "bin")
+    if not os.path.exists(os.path.join(lightningd_loc, "lightningd")):
+        raise Exception("Can't find our custom lightningd")
+    # To get the location of the jmcl plugin, we need the location of this python file:
+    floc = os.path.dirname(os.path.abspath(__file__))
+    jmcl_loc = os.path.join(floc, "..", "..", "jmdaemon", "jmdaemon", "jmcl.py")
+    command = [os.path.join(lightningd_loc, "lightningd"), "--plugin="+jmcl_loc,
+               "--jmport="+passthrough_port, "--lightning-dir=" + jm_ln_dir]
+    # testing needs static values:
+    if brpc_net == "regtest":
+        fixed_key_str = "121212121212121212121212121212121212121212121212121212121212121" + str(last_digit)
+        command.append("--dev-force-privkey="+fixed_key_str)
+    # we need to create c-lightning's own config file, in lightningdir/config.
+    # This requires the bitcoin rpc config also:
+    brpc_host = global_singleton.config.get("BLOCKCHAIN", "rpc_host")
+    brpc_port = global_singleton.config.get("BLOCKCHAIN", "rpc_port")
+    brpc_user = global_singleton.config.get("BLOCKCHAIN", "rpc_user")
+    brpc_password = global_singleton.config.get("BLOCKCHAIN", "rpc_password")
+    ln_serving_port = chaninfo["lightning-port"]
+    lnconfiglines = ["bitcoin-rpcconnect=" + brpc_host,
+                     "bitcoin-rpcport=" + brpc_port,
+                     "bitcoin-rpcuser=" + brpc_user,
+                     "bitcoin-rpcpassword=" + brpc_password,
+                     "network=" + brpc_net]
+    if brpc_net == "regtest":
+        lnconfiglines += ["addr=127.0.0.1:" + str(ln_serving_port),
+                          "log-level=debug",
+                          "log-file=" + jm_ln_dir + "/log",
+                          "dev-fast-gossip",
+                          "dev-bitcoind-poll=2"]
+    else:
+        lnconfiglines += ["proxy=127.0.0.1:9050",
+                     "bind-addr=127.0.0.1:" + str(ln_serving_port),
+                     "addr=autotor:127.0.0.1:9051/torport=" + str(ln_serving_port),
+                     "always-use-proxy=true"]
+    with open(os.path.join(jm_ln_dir, "config"), "w") as f:
+        f.write("\n".join(lnconfiglines))
+
+    FNULL = open(os.devnull, 'w')
+    print("starting ln with command: ", command)
+    ln_subprocess = subprocess.Popen(command, stdout=FNULL,
+                stderr=subprocess.STDOUT, close_fds=True)
+    def gracefully_kill_subprocess(p):
+        # See https://stackoverflow.com/questions/43274476/is-there-a-way-to-check-if-a-subprocess-is-still-running
+        if p.poll() is None:
+            p.send_signal(SIGINT)
+    atexit.register(gracefully_kill_subprocess, ln_subprocess)
 
 def load_test_config(**kwargs):
     if "config_path" not in kwargs:
