@@ -13,8 +13,7 @@
    --btcpwd=123456abcdef --btcconf=/blah/bitcoin.conf \
    -s test/ln-ygrunner.py
    '''
-import os
-from twisted.internet import task, reactor, defer
+from twisted.internet import reactor, defer
 from twisted.web.client import readBody, Headers
 from common import make_wallets
 import pytest
@@ -23,11 +22,9 @@ import json
 from datetime import datetime
 from jmbase import (get_nontor_agent, BytesProducer, jmprint,
                     get_log, stop_reactor, hextobin, bintohex)
-from jmbitcoin import privkey_to_pubkey
 from jmclient import (YieldGeneratorBasic, load_test_config, jm_single,
     JMClientProtocolFactory, start_reactor, SegwitWallet, get_mchannels,
-    SegwitLegacyWallet, SNICKERClientProtocolFactory, SNICKERReceiver,
-    JMWalletDaemon)
+    SegwitLegacyWallet, JMWalletDaemon)
 from jmclient.wallet_utils import wallet_gettimelockaddress
 from jmclient.wallet_rpc import api_version_string
 
@@ -42,70 +39,21 @@ FidelityBondMixin.TIMELOCK_ERA_YEARS = 2
 FidelityBondMixin.TIMELOCK_EPOCH_YEAR = datetime.now().year
 FidelityBondMixin.TIMENUMBERS_PER_PUBKEY = 12
 
-wallet_name = "test-ln-yg-runner.jmdat"
+wallet_name = "test-onion-yg-runner.jmdat"
 
 mean_amt = 2.0
 
-directory_node_indices = [1, 2]
+directory_node_indices = [1]
 
-# Note for tests of Lightning message channels:
-# (this data is not really needed *here* as the bots
-# retrieve their keys on startup with RPC `getinfo`, but is here
-# for reference).
 #
-# These nodes are generated with private keys (using --dev-force-privkey):
-# (note of course that c-lightning must be built with --enable-developer)
-# 121212121212121212121212121212121212121212121212121212121212121$i
-# with $i 1..3 (or n in general, see 'regtest-count' below.
-#
-# the passthrough ports are 4910$i and they all run on localhost (this is default for regtest).
-# the lightning node ports are 9735+$i
-# l1-regtest:
-#  lightningd: Server started with public key 03df15dbd9e20c811cc5f4155745e89540a0b83f33978317cebe9dfc46c5253c55,
-#  alias HOPPINGSET(color #03df15)
-# l2-regtest:
-#  lightningd: Server started with public key 036360e856310ce5d294e8be33fc807077dc56ac80d95d9cd4ddbd21325eff73f7,
-#  alias GREENSPAWN(color #036360)
-# l3-regtest:
-# lightningd: Server started with public key 02edde301d65a673fc8a37e9c8d34878adfbc561f66afbcc37db9bc9fbf5088ef5,
-# alias HOPPINGSQUIRREL(color #02edde)
-# We will treat the first of these three, as the directory node for the tests
-#
-# Here is the config the tester should actually enter in joinmarket.cfg:
-# [MESSAGING:lightning1]
-# type = ln-onion
-# clightning-location = bundled
-# directory-nodes = 03df15dbd9e20c811cc5f4155745e89540a0b83f33978317cebe9dfc46c5253c55@localhost:9735
-# passthrough-port = 49101
-# lightning-port = 9736
-# regtest-count=i
-#
-# and replace 'i' for how many bots you want. The passthrough port and lightning-port will be ignored in
-# favour of the settings mentioned above.
-#
-# note: this will auto-fill the directory /lightning under JM's datadir/lnregtest-$i,
-# during setup in configure.py, for each $i, and start a separate lightning daemon for each;
-# his setup is triggered by the use of regtest.
-# Most importantly, the lightning-rpc location for sending RPC calls, and the receiving
-# tcp passthrough port for receiving messages from jmcl.py, are dynamically created at
-# this point and then passed into the LNOnionMessageChannel object init, which are the
-# only way in which the daemon processing is dependent on the config (the other elements
-# all occur during the aforementioned setup).
-#
-def get_ln_messaging_config_regtest(run_num: int, dns=[1]):
-    """ Sets a ln messaging channel section for a regtest instance
+def get_onion_messaging_config_regtest(run_num: int, dns=[1], hsd=""):
+    """ Sets a onion messaging channel section for a regtest instance
     indexed by `run_num`. The indices to be used as directory nodes
     should be passed as `dns`, as a list of ints.
     """
-    rpc_location = os.path.join(jm_single().datadir,
-                    "lightning-regtest"+str(run_num),
-                    "regtest", "lightning-rpc")
-    passthrough_port = 49100 + run_num
     def location_string(directory_node_run_num):
-        return bintohex(privkey_to_pubkey(
-            hextobin("12"*31 + "1" + str(
-                directory_node_run_num) + "01"))) + "@127.0.0.1:" + str(
-            9735 + directory_node_run_num)
+        return "127.0.0.1:" + str(
+            8080 + directory_node_run_num)
     if run_num in dns:
         # means *we* are a dn, and dns currently
         # do not use other dns:
@@ -114,10 +62,21 @@ def get_ln_messaging_config_regtest(run_num: int, dns=[1]):
         dns_to_use = [location_string(a) for a in dns]
     dn_nodes_list = ",".join(dns_to_use)
     log.info("For node: {}, set dn list to: {}".format(run_num, dn_nodes_list))
-    return {"type": "ln-onion",
-            "lightning-rpc": rpc_location,
-            "passthrough-port": passthrough_port,
-            "directory-nodes": dn_nodes_list}
+    cf = {"type": "onion",
+            "socks5_host": "127.0.0.1",
+            "socks5_port": 9050,
+            "tor_control_host": "127.0.0.1",
+            "tor_control_port": 9051,
+            "onion_serving_host": "127.0.0.1",
+            "onion_serving_port": 8080 + run_num,
+            "hidden_service_dir": "",
+            "directory_nodes": dn_nodes_list,
+            "regtest_count": "1, 1"}
+    if run_num in dns:
+        # only directories need to use fixed hidden service directories:
+        cf["hidden_service_dir"] = hsd
+    return cf
+
 
 class RegtestJMClientProtocolFactory(JMClientProtocolFactory):
     i = 1
@@ -132,14 +91,19 @@ class RegtestJMClientProtocolFactory(JMClientProtocolFactory):
         # that's indexed to the regtest counter var:
         default_chans = get_mchannels()
         new_chans = []
-        ln_found = False
+        onion_found = False
+        hsd = ""
         for c in default_chans:
-            if "type" in c and c["type"] == "ln-onion":
-                ln_found = True
+            if "type" in c and c["type"] == "onion":
+                onion_found = True
+                if c["hidden_service_dir"] != "":
+                    hsd = c["hidden_service_dir"]
                 continue
-            new_chans.append(c)
-        if ln_found:
-            new_chans.append(get_ln_messaging_config_regtest(self.i, self.dns))
+            else:
+                new_chans.append(c)
+        if onion_found:
+            new_chans.append(get_onion_messaging_config_regtest(
+                self.i, self.dns, hsd))
         return new_chans
 
 class JMWalletDaemonT(JMWalletDaemon):
@@ -201,12 +165,12 @@ class TWalletRPCManager(object):
     def response_handler(self, response, handler):
         body = yield readBody(response)
         # these responses should always be 200 OK.
-        assert response.code == 200
+        #assert response.code == 200
         # handlers check the body is as expected; no return.
         yield handler(body)
         return True
 
-def test_start_yg_and_taker_setup(setup_ln_ygrunner):
+def test_start_yg_and_taker_setup(setup_onion_ygrunner):
     """Set up some wallets, for the ygs and 1 taker.
     Then start LN and the ygs in the background, then fire
     a startup of a wallet daemon for the taker who then
@@ -219,7 +183,7 @@ def test_start_yg_and_taker_setup(setup_ln_ygrunner):
         walletclass = SegwitLegacyWallet
 
     start_bot_num, end_bot_num = [int(x) for x in jm_single().config.get(
-        "MESSAGING:lightning1", "regtest-count").split(",")]
+        "MESSAGING:onion1", "regtest_count").split(",")]
     num_ygs = end_bot_num - start_bot_num
     # specify the number of wallets and bots of each type:
     wallet_services = make_wallets(num_ygs + 1,
@@ -394,7 +358,7 @@ def get_addr_and_fund(yg):
     jmprint('updated offerlist={}'.format(yg.offerlist))
 
 @pytest.fixture(scope="module")
-def setup_ln_ygrunner():
-    load_test_config(ln_backend_needed=True)
+def setup_onion_ygrunner():
+    load_test_config()
     jm_single().bc_interface.tick_forward_chain_interval = 10
     jm_single().bc_interface.simulate_blocks()

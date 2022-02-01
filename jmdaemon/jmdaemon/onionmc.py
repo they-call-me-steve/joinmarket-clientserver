@@ -1,24 +1,60 @@
 from jmdaemon.message_channel import MessageChannel
 from jmdaemon.protocol import COMMAND_PREFIX, JM_VERSION
-from jmbase import get_log, bintohex, hextobin, JM_APP_NAME
-from pyln.client import LightningRpc, RpcError
+from jmbase import get_log,  JM_APP_NAME, JMHiddenService
 import json
 import copy
 from typing import Callable, Union
-from twisted.internet import reactor, task
-from twisted.internet.protocol import ServerFactory
-from twisted.protocols.basic import LineReceiver
+from twisted.internet import reactor, task, protocol
+from twisted.protocols import basic
+from twisted.internet.endpoints import TCP4ClientEndpoint
+from twisted.internet.address import IPv4Address, IPv6Address
+from twisted.application.internet import ClientService
+from txtorcon.socks import TorSocksEndpoint
+
 log = get_log()
+
+def network_addr_to_string(location: Union[IPv4Address, IPv4Address]) -> str:
+    if isinstance(location, (IPv4Address, IPv6Address)):
+        host = location.host
+        port = location.port
+    else:
+        # TODO handle other addr types
+        assert False
+    return host + ":" + str(port)
+
+# module-level var to control whether we use Tor or not
+# (specifically for tests):
+testing_mode = False
+def set_testing_mode(configdata: dict) -> None:
+    """ Toggles testing mode which enables non-Tor
+    network setup:
+    """
+    global testing_mode
+    if not "regtest_count" in configdata:
+        log.debug("Onion message channel is not using regtest mode.")
+        testing_mode = False
+        return
+    try:
+        s, e = [int(x) for x in configdata["regtest_count"].split(",")]
+    except Exception as e:
+        log.info("Failed to get regtest count settings, error: {}".format(repr(e)))
+        testing_mode = False
+        return
+    if s == 0 and e == 0:
+        testing_mode = False
+        return
+    testing_mode = True
 
 """
 Messaging protocol (which wraps the underlying Joinmarket
 messaging protocol) used here is documented in:
-Joinmarket-Docs/lightning-messaging.md
+Joinmarket-Docs/onion-messaging.md
 """
 
 LOCAL_CONTROL_MESSAGE_TYPES = {"connect": 785, "disconnect": 787, "connect-in": 797}
 CONTROL_MESSAGE_TYPES = {"peerlist": 789, "getpeerlist": 791,
-                         "handshake": 793, "dn-handshake": 795}
+                         "handshake": 793, "dn-handshake": 795,
+                         "ping": 797, "pong": 799, "disconnect": 801}
 JM_MESSAGE_TYPES = {"privmsg": 685, "pubmsg": 687}
 
 # Used for some control message construction, as detailed below.
@@ -50,107 +86,190 @@ PEER_STATUS_UNCONNECTED, PEER_STATUS_CONNECTED, PEER_STATUS_HANDSHAKED, \
     PEER_STATUS_DISCONNECTED = range(4)
 
 
-""" this passthrough protocol allows
-    the joinmarket daemon to receive messages
-    from some outside process, instead of from
-    a client connection created in this process.
-    We use a LineReceiver as the app-layer distinguisher
-    of individual messages.
-"""
-class TCPPassThroughProtocol(LineReceiver):
-    def __init__(self, factory):
-        self.factory = factory
+class OnionPeerError(Exception):
+    pass
 
-    def connectionMade(self):
-        print("connection made in lnonion passthrough")
+class OnionPeerDirectoryWithoutHostError(OnionPeerError):
+    pass
 
-    def connectionLost(self, reason):
-        print("connection lost in lnonion passthrough")
+class OnionPeerConnectionError(OnionPeerError):
+    pass
 
-    def lineReceived(self, line):
-        """ Data passed over this TCP socket
-        is assumed to be JSON encoded, only.
+class OnionCustomMessageDecodingError(object):
+    pass
+
+class OnionCustomMessage(object):
+    """ Encapsulates the messages passed over the wire
+    to and from other onion peers
+    """
+    def __init__(self, text: str, msgtype: int):
+        self.text = text
+        self.msgtype = msgtype
+
+    def encode(self) -> str:
+        self.encoded = json.dumps({"type": self.msgtype,
+                        "line": self.text}).encode("utf-8")
+        return self.encoded
+
+    @classmethod
+    def from_string_decode(cls, msg: str) -> 'OnionCustomMessage':
+        """ Build a custom message from a json-ified string.
         """
         try:
-            data = line.decode("utf-8")
-        except UnicodeDecodeError:
-            log.warn("Received invalid data over the wire, ignoring.")
+            msg_obj = json.loads(msg)
+            text = msg_obj["line"]
+            msgtype = msg_obj["type"]
+        except:
+            raise OnionCustomMessageDecodingError
+        return cls(text, msgtype)
+
+class OnionLineProtocol(basic.LineReceiver):
+    def connectionMade(self):
+        self.factory.register_connection(self)
+
+    def connectionLost(self, reason):
+        self.factory.register_disconnection(self)
+
+    def lineReceived(self, line: str) -> None:
+        #print("received", repr(line))
+        msg = OnionCustomMessage.from_string_decode(line)
+        self.factory.receive_message(msg, self)
+
+    def message(self, message: OnionCustomMessage) -> None:
+        #log.info("in OnionLineProtocol, about to send message: {} to peer {}".format(message.encode(), self.transport.getPeer()))
+        self.transport.write(message.encode() + self.delimiter)
+
+class OnionLineProtocolFactory(protocol.ServerFactory):
+    """ This factory allows us to start up instances
+    of the LineReceiver protocol that are instantiated
+    towards us.
+    As such, it is responsible for keeping track
+    """
+    protocol = OnionLineProtocol
+
+    def __init__(self, client: 'OnionMessageChannel'):
+        self.client = client
+        self.peers = {}
+
+    def register_connection(self, p: OnionLineProtocol) -> None:
+        # make a local control message registering
+        # the new connection
+        peer_location = network_addr_to_string(p.transport.getPeer())
+        self.client.register_connection(peer_location, direction=0)
+        self.peers[peer_location] = p
+
+    def register_disconnection(self, p: OnionLineProtocol) -> None:
+        # make a local control message registering
+        # the new connection
+        peer_location = network_addr_to_string(p.transport.getPeer())
+        self.client.register_disconnection(peer_location)
+        if not peer_location in self.peers:
+            log.warn("Disconnection event registered for non-existent peer.")
             return
-        if len(self.factory.listeners) == 0:
-            log.msg("WARNING! We received: {} but there "
-                    "were no listeners.".format(data))
-        for listener in self.factory.listeners:
-            try:
-                listener.receive_msg(json.loads(data))
-            except json.decoder.JSONDecodeError as e:
-                log.warn("Received invalid data: {}, {}. ignoring.".format(
-                    data, repr(e)))
+        del self.peers[peer_location]
 
+    def receive_message(self, message: OnionCustomMessage,
+                        p: OnionLineProtocol) -> None:
+        self.client.receive_msg(message, network_addr_to_string(
+            p.transport.getPeer()))
 
-class TCPPassThroughFactory(ServerFactory):
-    # the protocol created here is a singleton,
-    # global to the joinmarket(d) process;
-    # we interact with it from multiple Joinmarket
-    # protocol instantiations by adding listeners
-    # (because all it does is listen).
-    # Listeners are added to the factory, not the
-    # protocol instance as that won't exist until
-    # someone connects.
-    def __init__(self):
-        # listeners will all receive
-        # all messages; they must have
-        # a `receive_msg` method that
-        # processes messages in JSON.
-        self.listeners = []
+    def send(self, message: OnionCustomMessage, destination: str) -> bool:
+        #print("trying to send in OnionLineProtocolFactory.")
+        #print("message: {}, destination: {}".format(message.encode(), destination))
+        if not (destination in self.peers):
+            print("sending message {}, destination {} was not in peers {}".format(message.encode(), destination, self.peers))
+            return False
+        proto = self.peers[destination]
+        proto.message(message)
+        return True
 
-    def buildProtocol(self, addr):
-        self.p = TCPPassThroughProtocol(self)
-        return self.p
+class OnionClientFactory(protocol.ReconnectingClientFactory):
+    """ We define a distinct protocol factory for the client side
+    connection, to ensure that we try to keep these connections alive.
+    Notably, this factory supports only *one* protocol instance at a time.
+    """
+    protocol = OnionLineProtocol
 
-    def add_tcp_listener(self, listener):
-        self.listeners.append(listener)
+    def __init__(self, message_receive_callback: Callable,
+                 connection_callback: Callable,
+                 disconnection_callback: Callable):
+        self.proto_client = None
+        # callback takes OnionCustomMessage as arg and returns None
+        self.message_receive_callback = message_receive_callback
+        # connection callback, no args, returns None
+        self.connection_callback = connection_callback
+        # disconnection the same
+        self.disconnection_callback = disconnection_callback
 
-    def remove_tcp_listener(self, listener):
-        try:
-            self.listeners.remove(listener)
-        except ValueError:
-            pass
+    def register_connection(self, p: OnionLineProtocol) -> None:
+        #print("in OnionClientFactory, registered a connection, proto instance: ", p)
+        self.proto_client = p
+        self.connection_callback()
 
-class LNOnionPeerError(Exception):
-    pass
+    def register_disconnection(self, p: OnionLineProtocol) -> None:
+        self.proto_client = None
+        self.disconnection_callback()
 
-class LNOnionPeerIDError(LNOnionPeerError):
-    pass
+    def send(self, msg: OnionCustomMessage) -> bool:
+        self.proto_client.message(msg)
 
-class LNOnionPeerDirectoryWithoutHostError(LNOnionPeerError):
-    pass
+    def receive_message(self, message: OnionCustomMessage,
+                        p: OnionLineProtocol) -> None:
+        self.message_receive_callback(message)
 
-class LNOnionPeerConnectionError(LNOnionPeerError):
-    pass
+    def clientConnectionLost(self, connector, reason):
+        log.debug('Connection to peer lost: {}, reason: {}'.format(connector, reason))
+        if reactor.running:
+            log.info('Attempting to reconnect...')
+            protocol.ReconnectingClientFactory.clientConnectionLost(
+                self, connector, reason)
 
-class LNCustomMsgFormatError(Exception):
-    pass
+    def clientConnectionFailed(self, connector, reason):
+        log.debug('Connection to peer failed: {}, reason: {}'.format(
+            connector, reason))
+        if reactor.running:
+            log.info('Attempting to reconnect...')
+            protocol.ReconnectingClientFactory.clientConnectionFailed(
+                self, connector, reason)
 
-class LNOnionPeer(object):
+class OnionPeer(object):
 
-    def __init__(self, peerid: str, hostname: str=None,
-                 port: int=-1, directory: bool=False,
-                 nick: str="", handshake_callback: Callable=None):
-        if not len(peerid) == 66:
-            # TODO: check valid pubkey without jmbitcoin?
-            raise LNOnionPeerIDError()
-        self.peerid = peerid
+    def __init__(self, messagechannel: 'OnionMessageChannel',
+                 socks5_host: str, socks5_port: int,
+                 hostname: str=None, port: int=-1,
+                 directory: bool=False, nick: str="",
+                 handshake_callback: Callable=None):
+        # reference to the managing OnionMessageChannel instance is
+        # needed so that we know where to send the messages received
+        # from this peer:
+        self.messagechannel = messagechannel
         self.nick = nick
+        # client side net config:
+        self.socks5_host = socks5_host
+        self.socks5_port = socks5_port
+        # remote net config:
         self.hostname = hostname
         self.port = port
         if directory and not (self.hostname):
-            raise LNOnionPeerDirectoryWithoutHostError()
+            raise OnionPeerDirectoryWithoutHostError()
         self.directory = directory
         self._status = PEER_STATUS_UNCONNECTED
         #A function to be called to initiate a handshake;
-        # it should take a single argument, an LNOnionPeer object,
+        # it should take a single argument, an OnionPeer object,
         #and return None.
         self.handshake_callback = handshake_callback
+        # Keep track of the protocol factory used to connect
+        # to the remote peer. Note that this won't always be used,
+        # if we have an inbound connection from this peer:
+        self.factory = None
+        # alternate location strings are used for inbound
+        # connections for this peer (these will be used first
+        # and foremost by directories, sending messages backwards
+        # on a connection created towards them).
+        self.alternate_location = ""
+
+    def set_alternate_location(self, location_string: str):
+        self.alternate_location = location_string
 
     def update_status(self, destn_status: int) -> None:
         """ Wrapping state updates to enforce:
@@ -172,6 +291,7 @@ class LNOnionPeer(object):
             ignored_updates = [PEER_STATUS_CONNECTED]
         elif self._status == PEER_STATUS_DISCONNECTED:
             allowed_updates = [PEER_STATUS_CONNECTED]
+            ignored_updates = [PEER_STATUS_DISCONNECTED]
         if destn_status in ignored_updates:
             # TODO: this happens sometimes from 2->1; why?
             log.debug("Attempt to update status of peer from {} "
@@ -182,7 +302,7 @@ class LNOnionPeer(object):
         self._status = destn_status
         # the handshakes are always initiated by a client:
         if destn_status == PEER_STATUS_CONNECTED:
-            log.info("We are calling the handshake callback as client.")
+            log.info("We, {}, are calling the handshake callback as client.".format(self.messagechannel.self_as_peer.peer_location()))
             self.handshake_callback(self)
 
     def status(self) -> int:
@@ -195,19 +315,25 @@ class LNOnionPeer(object):
 
     def get_nick_peerlocation_ser(self) -> str:
         if not self.nick:
-            raise LNOnionPeerError("Cannot serialize "
+            raise OnionPeerError("Cannot serialize "
                 "identifier string without nick.")
         return self.nick + NICK_PEERLOCATOR_SEPARATOR + \
-               self.peer_location_or_id()
+               self.peer_location()
 
     @classmethod
-    def from_location_string(cls, locstr: str,
+    def from_location_string(cls, mc: 'OnionMessageChannel',
+                location: str,
+                socks5_host: str,
+                socks5_port: int,
                 directory: bool=False,
-                handshake_callback: Callable=None) -> 'LNOnionPeer':
-        peerid, hostport = locstr.split("@")
-        host, port = hostport.split(":")
-        port = int(port)
-        return cls(peerid, host, port, directory,
+                handshake_callback: Callable=None) -> 'OnionPeer':
+        """ Allows construction of an OnionPeer from the
+        connection information given by the network interface.
+        TODO: special handling for inbound is needed.
+        """
+        host, port = location.split(":")
+        return cls(mc, socks5_host, socks5_port, hostname=host,
+                   port=int(port), directory=directory,
                    handshake_callback=handshake_callback)
 
     def set_host_port(self, hostname: str, port: int) -> None:
@@ -218,28 +344,20 @@ class LNOnionPeer(object):
         self.hostname = hostname
         self.port = port
 
-    def peer_location_or_id(self) -> str:
-        try:
-            return self.peer_location()
-        except AssertionError:
-            return self.peerid
-
-    def set_location(self, full_location_string: str) -> bool:
+    def set_location(self, location_string: str) -> bool:
         """ Allows setting location from an unchecked
         input string argument; if the string does not have
-        the required format, or its peerid does not match this peer,
+        the required format,
         will return False, otherwise self.hostname, self.port are
         updated for future `peer_location` calls, and True is returned.
         """
         try:
-            peerid, hostport = full_location_string.split("@")
-            assert peerid == self.peerid
-            host, port = hostport.split(":")
+            host, port = location_string.split(":")
             portint = int(port)
             assert portint > 0
         except Exception as e:
-            log.debug("Failed to update host and port of this peer ({}), "
-                      "error: {}".format(self.peerid, repr(e)))
+            log.debug("Failed to update host and port of this peer, "
+                      "error: {}".format(repr(e)))
             return False
         self.hostname = host
         self.port = portint
@@ -247,105 +365,103 @@ class LNOnionPeer(object):
 
     def peer_location(self) -> str:
         assert (self.hostname and self.port > 0)
-        return self.peerid + "@" + self.hostname + ":" + str(self.port)
+        return self.hostname + ":" + str(self.port)
 
-    def connect(self, rpcclient: LightningRpc) -> None:
-        """ This method is called to fire the RPC `connect`
-        call to the LN peer associated with this instance.
+    def send(self, message: OnionCustomMessage) -> bool:
+        """ If the message can be sent on either an inbound or
+        outbound connection, True is returned, else False.
+        """
+        if not self.factory:
+            #print("We are: {}. peer, wich was directory {}, did not have factory, so we send via mc".format(
+            #    self.messagechannel.self_as_peer.peer_location(), self.directory))
+            # we try to send via the overall message channel serving
+            # protocol, i.e. we assume the connection was made inbound:
+            #print("and to this location: ", self.peer_location())
+            return self.messagechannel.proto_factory.send(message, self.alternate_location)
+        #print("peer which was directory {} did have factory {}, we send via that".format(self.directory, self.factory))
+        return self.factory.send(message)
+
+    def receive_message(self, message: OnionCustomMessage) -> None:
+        self.messagechannel.receive_msg(message, self.peer_location())
+
+    def connect(self) -> None:
+        """ This method is called to connect, over Tor, to the remote
+        peer at the given onion host/port.
+        The connection is 'persistent' in the sense that we use a
+        ReconnectingClientFactory.
         """
         if self._status in [PEER_STATUS_HANDSHAKED, PEER_STATUS_CONNECTED]:
             return
         if not (self.hostname and self.port > 0):
-            raise LNOnionPeerConnectionError(
+            raise OnionPeerConnectionError(
                 "Cannot connect without host, port info")
-        try:
-            rpcclient.call("connect", [self.peer_location()])
-        except RpcError as e:
-            raise LNOnionPeerConnectionError(
-                "Connection to: {}failed with error: {}".format(
-                    self.peer_location(), repr(e)))
 
-    def try_to_connect(self, rpcclient: LightningRpc) -> None:
-        """ This method wraps LNOnionPeer.connect and accepts
+        self.factory = OnionClientFactory(self.receive_message,
+            self.register_connection, self.register_disconnection)
+        if testing_mode:
+            print("{} is making a tcp connection to {}, {}, {},".format(
+                self.messagechannel.self_as_peer.peer_location(), self.hostname, self.port, self.factory))
+            self.tcp_connector = reactor.connectTCP(self.hostname, self.port, self.factory)
+        else:
+            torEndpoint = TCP4ClientEndpoint(reactor, self.socks5_host, self.socks5_port)
+            onionEndpoint = TorSocksEndpoint(torEndpoint, self.hostname, self.port)
+            self.reconnecting_service = ClientService(onionEndpoint, self.factory)
+            self.reconnecting_service.startService()
+
+    def register_connection(self) -> None:
+        self.messagechannel.register_connection(self.peer_location(), direction=1)
+
+    def register_disconnection(self) -> None:
+        self.messagechannel.register_disconnection(self.peer_location())
+
+    def try_to_connect(self) -> None:
+        """ This method wraps OnionPeer.connect and accepts
         any error if that fails.
         """
         try:
-            self.connect(rpcclient=rpcclient)
-        except LNOnionPeerConnectionError as e:
+            self.connect()
+        except OnionPeerConnectionError as e:
             log.debug("Tried to connect but failed: {}".format(repr(e)))
         except Exception as e:
             log.warn("Got unexpected exception in connect attempt: {}".format(
                 repr(e)))
 
-    def disconnect(self, rpcclient: LightningRpc) -> None:
+    def disconnect(self) -> None:
         if self._status in [PEER_STATUS_UNCONNECTED, PEER_STATUS_DISCONNECTED]:
             return
         if not (self.hostname and self.port > 0):
-            raise LNOnionPeerConnectionError(
+            raise OnionPeerConnectionError(
                 "Cannot disconnect without host, port info")
-        try:
-            rpcclient.call("disconnect", [self.peer_location()])
-        except RpcError as e:
-            raise LNOnionPeerConnectionError("Disconnection from {} failed "
-                "with error: {}".format(self.peer_location(), repr(e)))
-        self.update_status(PEER_STATUS_DISCONNECTED)
+        d = self.reconnecting_service.stopService()
+        d.addCallback(self.complete_disconnection)
+        d.addErrback(log.warn, "Failed to disconnect from peer {}.".format(
+            self.peer_location()))
 
-class LNOnionDirectoryPeer(LNOnionPeer):
+    def complete_disconnection(self):
+        log.debug("Disconnected from peer: {}".format(self.peer_location()))
+        self.update_status(PEER_STATUS_DISCONNECTED)
+        self.factory = None
+
+class OnionDirectoryPeer(OnionPeer):
     delay = 4.0
-    def try_to_connect(self, rpcclient: LightningRpc) -> None:
+    def try_to_connect(self) -> None:
         # Delay deliberately expands out to very
         # long times as yg-s tend to be very long
         # running bots:
         self.delay *= 1.5
         if self.delay > 10000:
             log.warn("Cannot connect to directory node peer: {} "
-                     "after 20 attempts, giving up.".format(self.peerid))
+                     "after 20 attempts, giving up.".format(self.peer_location()))
             return
         try:
-            self.connect(rpcclient)
-        except LNOnionPeerConnectionError:
+            self.connect()
+        except OnionPeerConnectionError:
             reactor.callLater(self.delay, self.try_to_connect)
 
-class LNCustomMessage(object):
-    """ Encapsulates the messages passed over the wire
-    to and from c-lightning using the `sendcustommsg` rpc.
-    """
-    def __init__(self, text: str, msgtype: int):
-        self.text = text
-        self.msgtype = msgtype
-
-    def encode(self) -> str:
-        bintext = self.text.encode("utf-8")
-        hextext = bintohex(bintext)
-        hextype = "%0.4x" % self.msgtype
-        self.encoded = hextype + hextext
-        return self.encoded
-
-    @classmethod
-    def from_sendcustommsg_decode(cls, msg:
-                                     str) -> 'LNCustomMessage':
-        """ This is ~ the reverse operation to encode,
-        but note that we receive, via the plugin hook,
-        to the receive_msg event.
-        """
-        try:
-            type_hex = msg[:4]
-            message_hex = msg[4:]
-        except:
-            raise LNCustomMsgFormatError
-        msgtype = int(type_hex, 16)
-        text = hextobin(message_hex).decode("utf-8")
-        return cls(text, msgtype)
-
-class LNOnionMessageChannel(MessageChannel):
-    """ Uses the plugin architecture to hook
-    the `sendcustommsg` feature of c-lightning
-    to receive messages over the LN onion network,
-    and the provided RPC client LightningRPC to send
-    messages using the same command.
-    See the file jmcl.py for the actual Lightning plugin,
-    which must be loaded in a running instance of c-lightning,
-    for this to work.
+class OnionMessageChannel(MessageChannel):
+    """ Receives messages via a Torv3 hidden/onion service.
+    Sends messages to other nodes of the same type over Tor
+    via SOCKS5.
     Uses one or more configured "directory nodes"
     to access a list of current active nodes, and updates
     dynamically from messages seen.
@@ -355,26 +471,57 @@ class LNOnionMessageChannel(MessageChannel):
                  configdata,
                  daemon=None):
         MessageChannel.__init__(self, daemon=daemon)
-        # configures access to c-lightning RPC over the unix socket.
-        self.clnrpc_socket_path = configdata["lightning-rpc"]
         # hostid is a feature to avoid replay attacks across message channels;
-        # TODO investigate, but for now, treat LN as one "server".
-        self.hostid = "lightning-network"
+        # TODO investigate, but for now, treat onion-based as one "server".
+        self.hostid = "onion-network"
+        self.tor_control_host = configdata["tor_control_host"]
+        self.tor_control_port = int(configdata["tor_control_port"])
+        self.onion_serving_host=configdata["onion_serving_host"]
+        self.onion_serving_port=int(configdata["onion_serving_port"])
+        self.hidden_service_dir = configdata["hidden_service_dir"]
+        # client side config:
+        self.socks5_host = "127.0.0.1"
+        self.socks5_port = 9050
+        # we use the setting in the config sent over from
+        # the client, to decide whether to set up our connections
+        # over localhost (if testing), without Tor:
+        set_testing_mode(configdata)
+        log.info("after call to testing_mode, it is: {}".format(testing_mode))
         # keep track of peers. the list will be instances
-        # of LNOnionPeer:
+        # of OnionPeer:
         self.peers = set()
-        for dn in configdata["directory-nodes"].split(","):
+        for dn in configdata["directory_nodes"].split(","):
             # note we don't use a nick for directories:
-            self.peers.add(LNOnionDirectoryPeer.from_location_string(dn,
+            self.peers.add(OnionDirectoryPeer.from_location_string(
+                self, dn, self.socks5_host, self.socks5_port,
                 directory=True, handshake_callback=self.handshake_as_client))
-        # the protocol factory for receiving TCP message for us:
-        self.tcp_passthrough_factory = TCPPassThroughFactory()
-        port = configdata["passthrough-port"]
-        self.tcp_passthrough_listener = reactor.listenTCP(port,
-                                    self.tcp_passthrough_factory)
-        log.info("LNOnionMessageChannel is now listening on TCP port: {}".format(port))
-        # will be needed to send messages:
-        self.rpc_client = None
+        # we can direct messages via the protocol factory, which
+        # will index protocol connections by peer location:
+        self.proto_factory = OnionLineProtocolFactory(self)
+        if testing_mode:
+            # we serve over TCP:
+            self.testing_serverconn = reactor.listenTCP(self.onion_serving_port,
+                                self.proto_factory, interface="localhost")
+            self.onion_hostname = "127.0.0.1"
+        else:
+            self.hs = JMHiddenService(self.proto_factory,
+                                      self.info_callback,
+                                      self.setup_error_callback,
+                                      self.onion_hostname_callback,
+                                      self.tor_control_host,
+                                      self.tor_control_port,
+                                      self.onion_serving_host,
+                                      self.onion_serving_port,
+                                      shutdown_callback=self.shutdown_callback,
+                                      hidden_service_dir=self.hidden_service_dir)
+            # this call will start bringing up the HS; when it's finished,
+            # it will fire the `onion_hostname_callback`, or if it fails,
+            # it'll fire the `setup_error_callback`.
+            self.hs.start_tor()
+
+            # This will serve as our unique identifier, indicating
+            # that we are ready to communicate (in both directions) over Tor.
+            self.onion_hostname = None
 
         # intended to represent the special case of 'we are the
         # only directory node known', however for now dns don't interact
@@ -386,23 +533,30 @@ class LNOnionMessageChannel(MessageChannel):
         # the rpc connection calls are not using twisted)
         self.wait_for_directories_loop = None
 
-    def get_rpc_client(self, path):
-        return LightningRpc(path)
+    def info_callback(self, msg):
+        log.info(msg)
+
+    def setup_error_callback(self, msg):
+        log.error(msg)
+
+    def shutdown_callback(self, msg):
+        log.info("in shutdown callback: {}".format(msg))
+
+    def onion_hostname_callback(self, hostname):
+        """ This entrypoint marks the start of the OnionMessageChannel
+        running, since we need this unique identifier as our name
+        before we can start working (we need to compare it with the
+        configured directory nodes).
+        """
+        print("hostname: ", hostname)
+        print("type: ", type(hostname))
+        log.info("setting onion hostname to : {}".format(hostname))
+        self.onion_hostname = hostname
 
 # ABC implementation section
     def run(self) -> None:
-        self.rpc_client = self.get_rpc_client(self.clnrpc_socket_path)
-        # now the RPC is up, let's find out our own details,
-        # so we can forward them to peers:
-        self.get_our_peer_info()
-        # Next, tell the server routing Lightning messages *to* us
-        # that we're ready to listen:
-        self.tcp_passthrough_factory.add_tcp_listener(self)
-        # at this point the only peers added are directory
-        # nodes from config; we try to connect to all.
-        # We will get other peers to add to our list once they
-        # start sending us messages.
-        reactor.callLater(0.0, self.connect_to_directories)
+        self.hs_up_loop = task.LoopingCall(self.check_onion_hostname)
+        self.hs_up_loop.start(0.5)
 
     def get_pubmsg(self, msg:str, source_nick:str ="") -> str:
         """ Converts a message into the known format for
@@ -427,21 +581,21 @@ class LNOnionMessageChannel(MessageChannel):
         with the PUBLIC message type and nick.
         """
         peerids = self.get_directory_peers()
-        msg = LNCustomMessage(self.get_pubmsg(msg),
-                                JM_MESSAGE_TYPES["pubmsg"]).encode()
+        msg = OnionCustomMessage(self.get_pubmsg(msg),
+                                JM_MESSAGE_TYPES["pubmsg"])
         for peerid in peerids:
             # currently a directory node can send its own
             # pubmsgs (act as maker or taker); this will
             # probably be removed but is useful in testing:
-            if peerid == self.self_as_peer.peerid:
-                self.receive_msg({"peer_id": "00", "payload": msg})
+            if peerid == self.self_as_peer.peer_location():
+                self.receive_msg(msg, "00")
             else:
-                self._send(peerid, msg)
+                self._send(self.get_peer_by_id(peerid), msg)
 
     def _privmsg(self, nick: str, cmd: str, msg:str) -> None:
         log.debug("Privmsging to: {}, {}, {}".format(nick, cmd, msg))
-        encoded_privmsg = LNCustomMessage(self.get_privmsg(nick, cmd, msg),
-                            JM_MESSAGE_TYPES["privmsg"]).encode()
+        encoded_privmsg = OnionCustomMessage(self.get_privmsg(nick, cmd, msg),
+                            JM_MESSAGE_TYPES["privmsg"])
         peerid = self.get_peerid_by_nick(nick)
         if peerid:
             peer = self.get_peer_by_id(peerid)
@@ -454,12 +608,12 @@ class LNOnionMessageChannel(MessageChannel):
                      "sending via directory.".format(nick))
             try:
                 # TODO change this to redundant or switching?
-                peerid = self.get_connected_directory_peers()[0].peerid
+                peer = self.get_connected_directory_peers()[0]
             except Exception as e:
                 log.warn("Failed to send privmsg because no "
                 "directory peer is connected. Error: {}".format(repr(e)))
                 return
-        self._send(peerid, encoded_privmsg)
+        self._send(peer, encoded_privmsg)
 
     def _announce_orders(self, offerlist: list) -> None:
         for offer in offerlist:
@@ -467,48 +621,41 @@ class LNOnionMessageChannel(MessageChannel):
 
 # End ABC implementation section
 
+    def check_onion_hostname(self):
+        if not self.onion_hostname:
+            return
+        self.hs_up_loop.stop()
+        # now our hidden service is up, we must check our peer status
+        # then set up directories.
+        self.get_our_peer_info()
+        # at this point the only peers added are directory
+        # nodes from config; we try to connect to all.
+        # We will get other peers to add to our list once they
+        # start sending us messages.
+        reactor.callLater(0.0, self.connect_to_directories)
 
     def get_our_peer_info(self) -> None:
-        """ Create a special LNOnionPeer object,
+        """ Create a special OnionPeer object,
         outside of our peerlist, to refer to ourselves.
         """
-        resp = self.rpc_client.call("getinfo")
-        log.debug("Response from LN rpc getinfo: {}".format(resp))
-        # See: https://lightning.readthedocs.io/lightning-getinfo.7.html
-        # for the syntax of the response.
-        #
-        # TODO handle an error response.
-        peerid = resp["id"]
         dp = self.get_directory_peers()
         self_dir = False
-        if [peerid] == dp:
-            log.info("This is the genesis node: {}".format(peerid))
+        # only for publically exposed onion does the 'virtual port' exist;
+        # for local tests we always connect to an actual machine port:
+        port_to_check = 80 if not testing_mode else self.onion_serving_port
+        my_location_str = self.onion_hostname + ":" + str(port_to_check)
+        log.info("To check if we are genesis, we compare {} with {}".format(my_location_str, dp))
+        if [my_location_str] == dp:
+            log.info("This is the genesis node: {}".format(self.onion_hostname))
             self.genesis_node = True
             self_dir = True
-        elif peerid in dp:
+        elif my_location_str in dp:
             # Here we are just one of many directory nodes,
             # which should be fine, we should just be careful
             # to not query ourselves.
             self_dir = True
-
-        # TODO ; any obvious way to process multiple addresses,
-        # other than just take the first?
-        if len(resp["address"]) > 0:
-            a = resp["address"][0]
-        else:
-            # special case regtest: we just use local, no
-            # address, only binding:
-            a = resp["binding"][0]
-        addrtype = a["type"]
-        if addrtype not in ["ipv4", "ipv6", "torv3"]:
-            raise LNOnionPeerError("Unsupported internet address type: "
-                                   "{}".format(addrtype))
-        hostname = a["address"]
-        port = a["port"]
-        # TODO probably need to parse version, alias and network info
-        # TODO: could make class LNOnionDirectoryPeer if we are directory,
-        # but not needed for now.
-        self.self_as_peer = LNOnionPeer(peerid, hostname, port,
+        self.self_as_peer = OnionPeer(self, self.socks5_host, self.socks5_port,
+                                      self.onion_hostname, self.onion_serving_port,
                                         self_dir, nick=self.nick,
                                         handshake_callback=None)
 
@@ -520,10 +667,10 @@ class LNOnionMessageChannel(MessageChannel):
             return
         # the remaining code is only executed by non-directories:
         for p in self.peers:
-            log.info("Trying to connect to node: {}".format(p.peerid))
+            log.info("Trying to connect to node: {}".format(p.peer_location()))
             try:
-                p.connect(self.rpc_client)
-            except LNOnionPeerConnectionError:
+                p.connect()
+            except OnionPeerConnectionError:
                 pass
         # do not trigger on_welcome event until all directories
         # configured are ready:
@@ -532,10 +679,10 @@ class LNOnionMessageChannel(MessageChannel):
             self.wait_for_directories)
         self.wait_for_directories_loop.start(10.0)
 
-    def handshake_as_client(self, peer: LNOnionPeer) -> None:
+    def handshake_as_client(self, peer: OnionPeer) -> None:
         assert peer.status() == PEER_STATUS_CONNECTED
         if self.self_as_peer.directory:
-            log.debug("Not sending client handshake because we are directory.")
+            log.debug("Not sending client handshake to {} because we are directory.".format(peer.peer_location()))
             return
         our_hs = copy.deepcopy(client_handshake_json)
         our_hs["location-string"] = self.self_as_peer.peer_location()
@@ -543,86 +690,60 @@ class LNOnionMessageChannel(MessageChannel):
         # We fire and forget the handshake; successful setting
         # of the `is_handshaked` var in the Peer object will depend
         # on a valid/success return via the custommsg hook in the plugin.
-        log.info("Sending this handshake: {}".format(json.dumps(our_hs)))
-        self._send(peer.peerid,
-                   LNCustomMessage(json.dumps(our_hs),
-                    CONTROL_MESSAGE_TYPES["handshake"]).encode())
+        log.info("Sending this handshake: {} to peer {}".format(json.dumps(our_hs), peer.peer_location()))
+        self._send(peer, OnionCustomMessage(json.dumps(our_hs),
+                                    CONTROL_MESSAGE_TYPES["handshake"]))
 
-    def handshake_as_directory(self, peer: LNOnionPeer, our_hs: dict) -> None:
+    def handshake_as_directory(self, peer: OnionPeer, our_hs: dict) -> None:
         assert peer.status() == PEER_STATUS_CONNECTED
-        log.info("Sending this handshake: {}".format(json.dumps(our_hs)))
-        self._send(peer.peerid,
-                   LNCustomMessage(json.dumps(our_hs),
-                    CONTROL_MESSAGE_TYPES["dn-handshake"]).encode())
+        log.info("Sending this handshake as directory: {}".format(json.dumps(our_hs)))
+        self._send(peer, OnionCustomMessage(json.dumps(our_hs),
+                    CONTROL_MESSAGE_TYPES["dn-handshake"]))
 
     def get_directory_peers(self) -> list:
-        return [ p.peerid for p in self.peers if p.directory is True]
+        return [ p.peer_location() for p in self.peers if p.directory is True]
 
-    def get_peerid_by_nick(self, nick:str) -> Union[LNOnionPeer, None]:
+    def get_peerid_by_nick(self, nick:str) -> Union[OnionPeer, None]:
         for p in self.get_all_connected_peers():
             if p.nick == nick:
-                return p.peerid
+                return p.peer_location()
         return None
 
-    def _send(self, peerid: str, message: bytes) -> bool:
-        """
-        This method is "raw" in that it only respects
-        c-lightning's sendcustommsg syntax; it does
-        not manage the syntax of the underlying Joinmarket
-        message in any way.
-        Sends a message to a peer on the message channel,
-        identified by `peerid`, in hex format, with two byte
-        type prepended.
-        To encode the `message` field use `LNCustomMessage.encode`.
-        Arguments:
-        peerid: hex-encoded string.
-        message: raw bytes, encoded as per above.
-        Returns:
-        False if RpcError is raised by a failed RPC call,
-        or True otherwise.
-        """
-        # TODO handle return:
+    def _send(self, peer: OnionPeer, message: OnionCustomMessage) -> bool:
         try:
-            self.rpc_client.sendcustommsg(peerid, message)
-        except RpcError as e:
+            return peer.send(message)
+        except Exception as e:
             # This can happen when a peer disconnects, depending
             # on the timing:
-            log.warn("Failed RPC call to: " + peerid + \
-                     ", error: " + repr(e))
+            log.warn("Failed to send message to: {}, error: {}".format(
+                peer.peer_location(), repr(e)))
             return False
-        return True
 
     def shutdown(self):
         """ TODO
         """
 
-    def receive_msg(self, data: dict) -> None:
-        """ The entry point for all data coming over LN into our process.
-        This includes control messages from the plugin that inform
-        us about updates to peers. Our local messages will come in with
-        peer_id 00, and our message types are always two bytes long, these
-        two aspects are to conform with the current `sendcustommsg` RPC format.
+    def receive_msg(self, message: OnionCustomMessage, peer_location: str) -> None:
+        """ Messages from peers and also connection related control
+        messages. These messages either come via OnionPeer or via
+        the main OnionLineProtocolFactory instance that handles all
+        inbound connections.
         """
-        try:
-            peer = data["peer_id"]
-            msgobj = LNCustomMessage.from_sendcustommsg_decode(data["payload"])
-            log.debug("Receiving type: {}, message: {}".format(msgobj.msgtype, msgobj.text))
-        except LNCustomMsgFormatError:
-            log.warn("Incorrect custom message format: {}".format(data["payload"]))
+        if self.self_as_peer.directory:
+            print("received message as directory: ", message.encode())
+        peer = self.get_peer_by_id(peer_location)
+        if not peer:
+            log.warn("Received message but could not find peer: {}".format(peer_location))
             return
-        except Exception as e:
-            log.warn("Ill formed message received: {}, exception: {}".format(
-                data, e))
-            return
-        msgtype = msgobj.msgtype
-        msgval = msgobj.text
+        msgtype = message.msgtype
+        msgval = message.text
         if msgtype in LOCAL_CONTROL_MESSAGE_TYPES.values():
-            self.process_control_message(peer, msgtype, msgval)
-            # local control messages are processed first, as their "value"
-            # field is not in the onion-TLV format.
+            self.process_control_message(peer_location, msgtype, msgval)
+            # local control messages are processed first.
+            # TODO this is a historical artifact, we can simplify.
             return
 
-        if self.process_control_message(peer, msgtype, msgval):
+        if self.process_control_message(peer_location, msgtype, msgval):
             # will return True if it is, elsewise, a control message.
             return
 
@@ -637,8 +758,8 @@ class LNOnionMessageChannel(MessageChannel):
             from_nick, to_nick = nicks_msgs[:2]
             msg = COMMAND_PREFIX + COMMAND_PREFIX.join(nicks_msgs[2:])
             if to_nick == "PUBLIC":
-                log.debug("A pubmsg is being processed by {} from {}; it "
-                    "is {}".format(self.self_as_peer.nick, from_nick, msg))
+                #log.debug("A pubmsg is being processed by {} from {}; it "
+                #    "is {}".format(self.self_as_peer.nick, from_nick, msg))
                 self.on_pubmsg(from_nick, msg)
                 if self.self_as_peer.directory:
                     self.forward_pubmsg_to_peers(msg, from_nick)
@@ -669,14 +790,14 @@ class LNOnionMessageChannel(MessageChannel):
         # each other (i.e. they are *required* to only configure
         # themselves, not other dns). But this could happen by
         # accident.
-        encoded_msg = LNCustomMessage(pubmsg, msgtype).encode()
+        encoded_msg = OnionCustomMessage(pubmsg, msgtype)
         for peer in self.get_connected_nondirectory_peers():
             # don't loop back to the sender:
             if peer.nick == from_nick:
                 continue
             log.debug("Sending {}:{} to nondir peer {}".format(
-                msgtype, pubmsg, peer.peerid))
-            self._send(peer.peerid, encoded_msg)
+                msgtype, pubmsg, peer.peer_location()))
+            self._send(peer, encoded_msg)
 
     def forward_privmsg_to_peer(self, nick: str, message: str,
                                 from_nick: str) -> None:
@@ -693,10 +814,10 @@ class LNOnionMessageChannel(MessageChannel):
         cmd = cmdmsglist[0]
         msg = " ".join(cmdmsglist[1:])
         privmsg = self.get_privmsg(nick, cmd, msg, source_nick=from_nick)
-        log.debug("Sending out privmsg: {} to peer: {}".format(privmsg, peerid))
-        encoded_msg = LNCustomMessage(privmsg,
-                        JM_MESSAGE_TYPES["privmsg"]).encode()
-        self._send(peerid, encoded_msg)
+        #log.debug("Sending out privmsg: {} to peer: {}".format(privmsg, peerid))
+        encoded_msg = OnionCustomMessage(privmsg,
+                        JM_MESSAGE_TYPES["privmsg"])
+        self._send(self.get_peer_by_id(peerid), encoded_msg)
         # If possible, we forward the from-nick's network location
         # to the to-nick peer, so they can just talk directly next time.
         peerid_from = self.get_peerid_by_nick(from_nick)
@@ -708,8 +829,7 @@ class LNOnionMessageChannel(MessageChannel):
     def process_control_message(self, peerid: str, msgtype: int,
                                 msgval: str) -> bool:
         """ Triggered by a directory node feeding us
-        peers, or by a connect/disconnect hook
-        in the c-lightning plugin; this is our housekeeping
+        peers, or by a connect/disconnect hook; this is our housekeeping
         to try to create, and keep track of, useful connections.
         """
         all_ctrl = list(LOCAL_CONTROL_MESSAGE_TYPES.values(
@@ -746,7 +866,7 @@ class LNOnionMessageChannel(MessageChannel):
                               overwrite_connection=True, with_nick=True)
             try:
                 self.send_peers(p)
-            except LNOnionPeerConnectionError:
+            except OnionPeerConnectionError:
                 pass
             # comment much as above; if we can't connect, it's none
             # of our business.
@@ -762,13 +882,11 @@ class LNOnionMessageChannel(MessageChannel):
             self.add_peer(msgval, connection=True,
                           overwrite_connection=True)
         elif msgtype == LOCAL_CONTROL_MESSAGE_TYPES["connect-in"]:
-            # in this case we don't have network connection info;
-            # just add the peer as a peerid:
-            self.add_peer(msgval.split("@")[0], connection=True,
+            self.add_peer(msgval, connection=True,
                           overwrite_connection=True)
         elif msgtype == LOCAL_CONTROL_MESSAGE_TYPES["disconnect"]:
             log.debug("We got a disconnect event: {}".format(msgval))
-            if msgval in [x.peerid for x in self.get_connected_directory_peers()]:
+            if msgval in [x.peer_location() for x in self.get_connected_directory_peers()]:
                 # we need to use the full peer locator string, so that
                 # add_peer knows it can try to reconnect:
                 msgval = self.get_peer_by_id(msgval).peer_location()
@@ -789,7 +907,7 @@ class LNOnionMessageChannel(MessageChannel):
             log.warn("Unexpected handshake from unknown peer: {}, "
                      "ignoring.".format(peerid))
             return
-        assert isinstance(peer, LNOnionPeer)
+        assert isinstance(peer, OnionPeer)
         if not peer.status() == PEER_STATUS_CONNECTED:
             # we were not waiting for it:
             log.warn("Unexpected handshake from peer: {}, "
@@ -797,6 +915,7 @@ class LNOnionMessageChannel(MessageChannel):
                          peerid, peer.status()))
             return
         if dn:
+            print("We, {}, are processing a handshake with dn {} from peer {}".format(self.self_as_peer.peer_location(), dn, peerid))
             # it means, we are a non-dn and we are expecting
             # a returned `dn-handshake` message:
             # (currently dns don't talk to other dns):
@@ -841,6 +960,7 @@ class LNOnionMessageChannel(MessageChannel):
             peer.update_status(PEER_STATUS_HANDSHAKED)
             peer.set_nick(nick)
         else:
+            print("We, {}, are processing a handshake with dn {} from peer {}".format(self.self_as_peer.peer_location(), dn, peerid))
             # it means, we are receiving an initial handshake
             # message from a 'client' (non-dn) peer.
             # dns don't talk to each other:
@@ -871,30 +991,61 @@ class LNOnionMessageChannel(MessageChannel):
             # allow publishing their location via `getpeerlist`:
             if not peer.set_location(full_location_string):
                 accepted = False
+            if not peerid == full_location_string:
+                print("we are reading a handshake from location {} but they sent"
+                      "us full location string {}, setting an alternate".format(
+                          peerid, full_location_string))
+                peer.set_alternate_location(peerid)
             peer.set_nick(nick)
             # client peer's handshake message was valid; send ours, and
             # then mark this peer as successfully handshaked:
             our_hs = copy.deepcopy(server_handshake_json)
             our_hs["nick"] = self.nick
             our_hs["accepted"] = accepted
-            self.handshake_as_directory(peer, our_hs)
+            if self.self_as_peer.directory:
+                self.handshake_as_directory(peer, our_hs)
             if accepted:
                 peer.update_status(PEER_STATUS_HANDSHAKED)
 
-    def get_peer_by_id(self, p: str) -> Union[LNOnionPeer, bool]:
-        """ Returns the LNOnionPeer with peerid p,
+    def get_peer_by_id(self, p: str) -> Union[OnionPeer, bool]:
+        """ Returns the OnionPeer with peer location p,
         if it is in self.peers, otherwise returns False.
         """
+        if p == "00":
+            return self.self_as_peer
         for x in self.peers:
-            if x.peerid == p:
+            if x.peer_location() == p:
+                return x
+            if x.alternate_location == p:
                 return x
         return False
+
+    def register_connection(self, peer_location: str, direction: int) -> None:
+        """ We send ourselves a local control message indicating
+        the new connection.
+        If the connection is inbound, direction == 0, else 1.
+        """
+        assert direction in range(2)
+        if direction == 1:
+            msgtype = LOCAL_CONTROL_MESSAGE_TYPES["connect"]
+        else:
+            msgtype = LOCAL_CONTROL_MESSAGE_TYPES["connect-in"]
+        msg = OnionCustomMessage(peer_location, msgtype)
+        self.receive_msg(msg, "00")
+
+    def register_disconnection(self, peer_location: str) -> None:
+        """ We send ourselves a local control message indicating
+        the disconnection.
+        """
+        msg = OnionCustomMessage(peer_location,
+                    LOCAL_CONTROL_MESSAGE_TYPES["disconnect"])
+        self.receive_msg(msg, "00")
 
     def add_peer(self, peerdata: str, connection: bool=False,
                 overwrite_connection: bool=False, with_nick=False) -> None:
         """ add non-directory peer from (nick, peer) serialization `peerdata`,
-        where "peer" is peerid or full peerid@host:port;
-        return the created LNOnionPeer object. Or, with_nick=False means
+        where "peer" is host:port;
+        return the created OnionPeer object. Or, with_nick=False means
         that `peerdata` has only the peer location.
         If the peer is already in our peerlist it can be updated in
         one of these ways:
@@ -903,7 +1054,7 @@ class LNOnionMessageChannel(MessageChannel):
         with this conditional on whether the flag `overwrite_connection` is
         set. Note that this peer removal, unlike the peer addition above,
         can also occur for directory nodes, if we lose connection (and then
-        we persistently try to reconnect; see LNOnionDirectoryPeer).
+        we persistently try to reconnect; see OnionDirectoryPeer).
         """
         if with_nick:
             try:
@@ -916,69 +1067,48 @@ class LNOnionMessageChannel(MessageChannel):
                 return
         else:
             peer = peerdata
-        if len(peer) == 66:
-            p = self.get_peer_by_id(peer)
-            if not p:
-                # no address info here
-                p = LNOnionPeer(peer, handshake_callback=self.handshake_as_client)
+
+        # assumed that it's passing a full string
+        try:
+            temp_p = OnionPeer.from_location_string(self, peer,
+                        self.socks5_host, self.socks5_port,
+                        handshake_callback=self.handshake_as_client)
+        except Exception as e:
+            # There are currently a few ways the location
+            # parsing and Peer object construction can fail;
+            # TODO specify exception types.
+            log.warn("Failed to add peer: {}, exception: {}".format(peer, repr(e)))
+            return
+        if not self.get_peer_by_id(temp_p.peer_location()):
+            if connection:
+                log.info("Updating status of peer: {} to connected.".format(temp_p.peer_location()))
+                temp_p.update_status(PEER_STATUS_CONNECTED)
+            else:
+                temp_p.update_status(PEER_STATUS_DISCONNECTED)
+            if with_nick:
+                temp_p.set_nick(nick)
+            self.peers.add(temp_p)
+            if not connection:
+                # Here, we are not currently connected. We
+                # try to connect asynchronously. We don't pay attention
+                # to any return. This attempt is one-shot and opportunistic,
+                # for non-dns, but will retry with exp-backoff for dns.
+                # Notice this is only possible for non-dns to other non-dns,
+                # since dns will never reach this point without an active
+                # connection.
+                reactor.callLater(0.0, temp_p.try_to_connect)
+            return temp_p
+        else:
+            p = self.get_peer_by_id(temp_p.peer_location())
+            if overwrite_connection:
                 if connection:
-                    log.info("Updating status to connected.")
-                    p.update_status(PEER_STATUS_CONNECTED)
-                self.peers.add(p)
-            elif overwrite_connection:
-                if connection:
-                    log.info("Updating status to connected.")
+                    log.info("Updating status to connected for peer {}.".format(temp_p.peer_location()))
                     p.update_status(PEER_STATUS_CONNECTED)
                 else:
                     p.update_status(PEER_STATUS_DISCONNECTED)
             if with_nick:
                 p.set_nick(nick)
             return p
-        elif len(peer) > 66:
-            # assumed that it's passing a full string
-            try:
-                temp_p = LNOnionPeer.from_location_string(peer,
-                            handshake_callback=self.handshake_as_client)
-            except Exception as e:
-                # There are currently a few ways the location
-                # parsing and Peer object construction can fail;
-                # TODO specify exception types.
-                log.warn("Failed to add peer: {}, exception: {}".format(peer, repr(e)))
-                return
-            if not self.get_peer_by_id(temp_p.peerid):
-                if connection:
-                    log.info("Updating status to connected.")
-                    temp_p.update_status(PEER_STATUS_CONNECTED)
-                else:
-                    temp_p.update_status(PEER_STATUS_DISCONNECTED)
-                if with_nick:
-                    temp_p.set_nick(nick)
-                self.peers.add(temp_p)
-                if not connection:
-                    # Here, we have a full location string,
-                    # and we are not currently connected. We
-                    # try to connect asynchronously. We don't pay attention
-                    # to any return. This attempt is one-shot and opportunistic,
-                    # for non-dns, but will retry with exp-backoff for dns.
-                    # Notice this is only possible for non-dns to other non-dns,
-                    # since dns will never reach this point without an active
-                    # connection.
-                    reactor.callLater(0.0, temp_p.try_to_connect, self.rpc_client)
-                return temp_p
-            else:
-                p = self.get_peer_by_id(temp_p.peerid)
-                if overwrite_connection:
-                    if connection:
-                        log.info("Updating status to connected.")
-                        p.update_status(PEER_STATUS_CONNECTED)
-                    else:
-                        p.update_status(PEER_STATUS_DISCONNECTED)
-                if with_nick:
-                    p.set_nick(nick)
-                return p
-        else:
-            raise LNOnionPeerError(
-            "Invalid peer location string: {}".format(peer))
 
     def get_all_connected_peers(self) -> list:
         return self.get_connected_directory_peers() + \
@@ -995,7 +1125,8 @@ class LNOnionMessageChannel(MessageChannel):
     def wait_for_directories(self) -> None:
         # Notice this is checking for *handshaked* dps;
         # the handshake will have been initiated once a
-        # connection was seen in the plugin:
+        # connection was seen:
+        log.warn("in the wait for directories loop, this is the connected dps: {}".format(self.get_connected_directory_peers()))
         if len(self.get_connected_directory_peers()) == 0:
             return
         # This is what triggers the start of taker/maker workflows.
@@ -1006,7 +1137,7 @@ class LNOnionMessageChannel(MessageChannel):
 
     """ CONTROL MESSAGES SENT BY US
     """
-    def send_peers(self, requesting_peer: LNOnionPeer,
+    def send_peers(self, requesting_peer: OnionPeer,
                    peerid_filter: list=[]) -> None:
         """ This message is sent by directory peers on request
         by non-directory peers.
@@ -1021,14 +1152,14 @@ class LNOnionMessageChannel(MessageChannel):
             messages (TODO).
         """
         if not requesting_peer.status() == PEER_STATUS_HANDSHAKED:
-            raise LNOnionPeerConnectionError(
+            raise OnionPeerConnectionError(
                 "Cannot send peer list to unhandshaked peer")
         peerlist = set()
         for p in self.get_connected_nondirectory_peers():
             # don't send a peer to itself
-            if p.peerid == requesting_peer.peerid:
+            if p.peer_location() == requesting_peer.peer_location():
                 continue
-            if len(peerid_filter) > 0 and p.peerid not in peerid_filter:
+            if len(peerid_filter) > 0 and p.peer_location() not in peerid_filter:
                 continue
             if not p.status() == PEER_STATUS_HANDSHAKED:
                 # don't advertise what is not online.
@@ -1040,7 +1171,5 @@ class LNOnionMessageChannel(MessageChannel):
             peerlist.add(p.get_nick_peerlocation_ser())
         # For testing: dns won't usually participate:
         peerlist.add(self.self_as_peer.get_nick_peerlocation_ser())
-        self._send(requesting_peer.peerid, LNCustomMessage(",".join(
-            peerlist), CONTROL_MESSAGE_TYPES["peerlist"]).encode())
-
-
+        self._send(requesting_peer, OnionCustomMessage(",".join(
+            peerlist), CONTROL_MESSAGE_TYPES["peerlist"]))

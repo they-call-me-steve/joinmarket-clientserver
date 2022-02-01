@@ -9,7 +9,7 @@ from .protocol import (COMMAND_PREFIX, ORDER_KEYS, NICK_HASH_LENGTH,
                        COMMITMENT_PREFIXES)
 
 from .irc import IRCMessageChannel
-from .lnonion import LNOnionMessageChannel
+from .onionmc import OnionMessageChannel
 from jmbase import (is_hs_uri, get_tor_agent, JMHiddenService,
                     get_nontor_agent, BytesProducer, wrapped_urlparse,
                     bdict_sdict_convert, JMHTTPResource)
@@ -523,8 +523,8 @@ class JMDaemonServerProtocol(amp.AMP, OrderbookWatch):
             self.restart_mc_required = True
             mcs = []
             for c in self.irc_configs:
-                if "type" in c and c["type"] == "ln-onion":
-                    mcs.append(LNOnionMessageChannel(c, daemon=self))
+                if "type" in c and c["type"] == "onion":
+                    mcs.append(OnionMessageChannel(c, daemon=self))
                 else:
                     # default is IRC; TODO allow others
                     mcs.append(IRCMessageChannel(c,
