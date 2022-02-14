@@ -394,6 +394,7 @@ parse_flags ()
             --docker-install)
                 with_sudo='0'
                 with_jmvenv='0'
+                ;;
             "")
                 break
                 ;;
@@ -499,6 +500,7 @@ main ()
             return 1
         fi
         source "${jm_root}/bin/activate"
+    fi
     mkdir -p "deps/cache"
     pushd deps
     if ! libsecp256k1_install; then
