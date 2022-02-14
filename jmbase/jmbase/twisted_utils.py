@@ -193,6 +193,9 @@ class JMHiddenService(object):
         else:
             ep = "onion:" + str(self.virtual_port) + ":localPort="
             ep += str(self.serving_port)
+            # endpoints.TCPHiddenServiceEndpoint creates version 2 by
+            # default for backwards compat (err, txtorcon needs to update that ...)
+            ep += ":version=3"
             ep += ":hiddenServiceDir="+self.hidden_service_dir
             onion_endpoint = serverFromString(reactor, ep)
             d = onion_endpoint.listen(self.proto_factory)
