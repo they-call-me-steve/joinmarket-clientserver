@@ -186,8 +186,9 @@ onion_serving_port = 8080
 # This is mandatory for directory nodes (who must also set their
 # own *.onion:port as the only directory in directory_nodes, below),
 # but NOT TO BE USED by non-directory nodes (which is you, unless
-# you know otherwise!), as it will greatly degrade your privacy:
-hidden_service_dir = ""
+# you know otherwise!), as it will greatly degrade your privacy.
+# (note the default is no value, don't replace it with "").
+hidden_service_dir =
 #
 # This is a comma separated list (comma can be omitted if only one item).
 # Each item has format host:port ; both are required, though port will

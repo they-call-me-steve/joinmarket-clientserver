@@ -59,7 +59,8 @@ and the default control port 9051 (if not, change that value in the `joinmarket.
 #### Why not use Lightning based onions?
 
 (*Feel free to skip this section if you don't know what "Lightning based onions" refers to!*). The reason this architecture is
-proposed as an alternative to the previously suggested Lightning-node-based network (see [this PR], is mostly that:
+proposed as an alternative to the previously suggested Lightning-node-based network (see
+[this PR](https://github.com/JoinMarket-Org/joinmarket-clientserver/pull/1000)), is mostly that:
 
 * the latter has a bunch of extra installation and maintenance dependencies (just one example: pyln-client requires coincurve, which we just
 removed)
