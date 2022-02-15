@@ -95,7 +95,7 @@ class OnionPeerDirectoryWithoutHostError(OnionPeerError):
 class OnionPeerConnectionError(OnionPeerError):
     pass
 
-class OnionCustomMessageDecodingError(object):
+class OnionCustomMessageDecodingError(Exception):
     pass
 
 class OnionCustomMessage(object):
@@ -132,7 +132,12 @@ class OnionLineProtocol(basic.LineReceiver):
 
     def lineReceived(self, line: str) -> None:
         #print("received", repr(line))
-        msg = OnionCustomMessage.from_string_decode(line)
+        try:
+            msg = OnionCustomMessage.from_string_decode(line)
+        except OnionCustomMessageDecodingError:
+            log.debug("Received invalid message, dropping connection.")
+            self.transport.loseConnection()
+            return
         self.factory.receive_message(msg, self)
 
     def message(self, message: OnionCustomMessage) -> None:
