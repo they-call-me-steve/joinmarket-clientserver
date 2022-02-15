@@ -53,16 +53,14 @@ deps_install ()
         'python3-dev' \
         'python3-pip' \
         'python3-setuptools' \
-        'libltdl-dev' \
-        'unzip' )
+        'libltdl-dev' )
 
     if [ "$with_jmvenv" == 1 ]; then debian_deps+=("virtualenv"); fi
     if [ "$with_sudo" == 1 ]; then debian_deps+=("sudo"); fi
 
     darwin_deps=( \
         'automake' \
-        'libtool' \
-        'unzip' )
+        'libtool' )
 
     if ! is_python3; then
         echo "Python 2 is no longer supported. Please use a compatible Python 3 version."
@@ -172,11 +170,7 @@ dep_get ()
     if ! sha256_verify "${pkg_hash}" "${pkg_name}"; then
         return 1
     fi
-    if [[ $1 == *zip ]]; then
-        unzip -o "${pkg_name}" -d ../
-    else
-        tar -xzf "${pkg_name}" -C ../
-    fi
+    tar -xzf "${pkg_name}" -C ../
     popd
 }
 
