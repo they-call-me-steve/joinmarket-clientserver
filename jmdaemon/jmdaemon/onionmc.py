@@ -8,7 +8,6 @@ from twisted.internet import reactor, task, protocol
 from twisted.protocols import basic
 from twisted.internet.endpoints import TCP4ClientEndpoint
 from twisted.internet.address import IPv4Address, IPv6Address
-from twisted.application.internet import ClientService
 from txtorcon.socks import TorSocksEndpoint
 
 log = get_log()
@@ -188,9 +187,8 @@ class OnionLineProtocolFactory(protocol.ServerFactory):
         proto.message(message)
         return True
 
-class OnionClientFactory(protocol.ReconnectingClientFactory):
-    """ We define a distinct protocol factory for the client side
-    connection, to ensure that we try to keep these connections alive.
+class OnionClientFactory(protocol.ServerFactory):
+    """ We define a distinct protocol factory for outbound connections.
     Notably, this factory supports only *one* protocol instance at a time.
     """
     protocol = OnionLineProtocol
@@ -222,6 +220,7 @@ class OnionClientFactory(protocol.ReconnectingClientFactory):
                         p: OnionLineProtocol) -> None:
         self.message_receive_callback(message)
 
+    """
     def clientConnectionLost(self, connector, reason):
         log.debug('Connection to peer lost: {}, reason: {}'.format(connector, reason))
         if reactor.running:
@@ -236,6 +235,7 @@ class OnionClientFactory(protocol.ReconnectingClientFactory):
             log.info('Attempting to reconnect...')
             protocol.ReconnectingClientFactory.clientConnectionFailed(
                 self, connector, reason)
+    """
 
 class OnionPeer(object):
 
@@ -410,8 +410,7 @@ class OnionPeer(object):
         else:
             torEndpoint = TCP4ClientEndpoint(reactor, self.socks5_host, self.socks5_port)
             onionEndpoint = TorSocksEndpoint(torEndpoint, self.hostname, self.port)
-            self.reconnecting_service = ClientService(onionEndpoint, self.factory)
-            self.reconnecting_service.startService()
+            onionEndpoint.connect(self.factory)
 
     def register_connection(self) -> None:
         self.messagechannel.register_connection(self.peer_location(), direction=1)
