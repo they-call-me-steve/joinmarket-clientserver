@@ -46,7 +46,7 @@ mean_amt = 2.0
 directory_node_indices = [1]
 
 #
-def get_onion_messaging_config_regtest(run_num: int, dns=[1], hsd=""):
+def get_onion_messaging_config_regtest(run_num: int, dns=[1], hsd="", mode="TAKER"):
     """ Sets a onion messaging channel section for a regtest instance
     indexed by `run_num`. The indices to be used as directory nodes
     should be passed as `dns`, as a list of ints.
@@ -72,6 +72,10 @@ def get_onion_messaging_config_regtest(run_num: int, dns=[1], hsd=""):
             "hidden_service_dir": "",
             "directory_nodes": dn_nodes_list,
             "regtest_count": "1, 1"}
+    if mode == "MAKER":
+        cf["serving"] = True
+    else:
+        cf["serving"] = False
     if run_num in dns:
         # only directories need to use fixed hidden service directories:
         cf["hidden_service_dir"] = hsd
@@ -85,11 +89,11 @@ class RegtestJMClientProtocolFactory(JMClientProtocolFactory):
         # for this test:
         self.dns = dns
 
-    def get_mchannels(self):
+    def get_mchannels(self, mode="TAKER"):
         # swaps out any existing lightning configs
         # in the config settings on startup, for one
         # that's indexed to the regtest counter var:
-        default_chans = get_mchannels()
+        default_chans = get_mchannels(mode=mode)
         new_chans = []
         onion_found = False
         hsd = ""
@@ -103,7 +107,7 @@ class RegtestJMClientProtocolFactory(JMClientProtocolFactory):
                 new_chans.append(c)
         if onion_found:
             new_chans.append(get_onion_messaging_config_regtest(
-                self.i, self.dns, hsd))
+                self.i, self.dns, hsd, mode=mode))
         return new_chans
 
 class JMWalletDaemonT(JMWalletDaemon):

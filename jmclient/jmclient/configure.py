@@ -540,7 +540,7 @@ def set_config(cfg, bcint=None):
         global_singleton.bc_interface = bcint
 
 
-def get_mchannels():
+def get_mchannels(mode="TAKER"):
     SECTION_NAME = 'MESSAGING'
     # FIXME: remove in future release
     if jm_single().config.has_section(SECTION_NAME):
@@ -604,6 +604,12 @@ def get_mchannels():
             except NoOptionError:
                 continue
             onion_data[option] = otype(val)
+        # the onion messaging section must specify whether
+        # to serve an onion:
+        if mode == "MAKER":
+            onion_data["serving"] = True
+        else:
+            onion_data["serving"] = False
         onion_data['btcnet'] = get_network()
         # Just to allow a dynamic set of var:
         onion_data["section-name"] = section
