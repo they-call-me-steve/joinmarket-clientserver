@@ -272,7 +272,7 @@ def start_test_taker(wallet_service, i):
     # and the wallet_service is set manually,
     # so no unlock etc.
     mgr = TWalletRPCManager()
-    mgr.daemon.wallet_service = wallet_service
+    mgr.daemon.services["wallet"] = wallet_service
     # because we are manually setting the wallet_service
     # of the JMWalletDaemon instance, we do not follow the
     # usual flow of `initialize_wallet_service`, we do not set
@@ -280,11 +280,9 @@ def start_test_taker(wallet_service, i):
     # sync the wallet, including bypassing any restart callback:
     def dummy_restart_callback(msg):
         log.warn("Ignoring rescan request from backend wallet service: " + msg)
-    mgr.daemon.wallet_service.add_restart_callback(dummy_restart_callback)
+    mgr.daemon.services["wallet"].add_restart_callback(dummy_restart_callback)
     mgr.daemon.wallet_name = wallet_name
-    while not mgr.daemon.wallet_service.synced:
-        mgr.daemon.wallet_service.sync_wallet(fast=True)
-    mgr.daemon.wallet_service.startService()
+    mgr.daemon.services["wallet"].startService()
     def get_client_factory():
         clientfactory = RegtestJMClientProtocolFactory(mgr.daemon.taker,
                                                        proto_type="TAKER")
@@ -297,7 +295,7 @@ def start_test_taker(wallet_service, i):
     # we decide a coinjoin destination and amount. Choosing
     # a destination in the wallet is a bit easier because
     # we can query the mixdepth balance at the end.
-    coinjoin_destination = mgr.daemon.wallet_service.get_internal_addr(4)
+    coinjoin_destination = mgr.daemon.services["wallet"].get_internal_addr(4)
     cj_amount = 22000000
     # once the taker is finished we sanity check before
     # shutting down:
@@ -305,7 +303,7 @@ def start_test_taker(wallet_service, i):
                                waittime=0.0, txdetails=None):
         jmprint("Taker is finished")
         # check that the funds have arrived.
-        mbal = mgr.daemon.wallet_service.get_balance_by_mixdepth()[4]
+        mbal = mgr.daemon.services["wallet"].get_balance_by_mixdepth()[4]
         assert mbal == cj_amount
         jmprint("Funds: {} sats successfully arrived into mixdepth 4.".format(cj_amount))
         stop_reactor()

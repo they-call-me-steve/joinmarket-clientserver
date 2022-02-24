@@ -134,7 +134,15 @@ class OnionCustomMessage(object):
             msg_obj = json.loads(msg)
             text = msg_obj["line"]
             msgtype = msg_obj["type"]
+            # we insist on integer but not a valid msgtype,
+            # crudely 'syntax, not semantics':
+            # semantics is the job of the OnionMessageChannel object.
+            assert isinstance(msgtype, int)
+            assert isinstance(text, str)
         except:
+            # this blanket catch and re-raise:
+            # we must handle untrusted input bytes without
+            # crashing under any circumstance.
             raise OnionCustomMessageDecodingError
         return cls(text, msgtype)
 
@@ -149,7 +157,8 @@ class OnionLineProtocol(basic.LineReceiver):
         try:
             msg = OnionCustomMessage.from_string_decode(line)
         except OnionCustomMessageDecodingError:
-            log.debug("Received invalid message, dropping connection.")
+            log.debug("Received invalid message: {}, "
+                      "dropping connection.".format(line))
             self.transport.loseConnection()
             return
         self.factory.receive_message(msg, self)
@@ -199,7 +208,7 @@ class OnionLineProtocolFactory(protocol.ServerFactory):
         proto.message(message)
         return True
 
-class OnionClientFactory(protocol.ServerFactory):
+class OnionClientFactory(protocol.ClientFactory):
     """ We define a distinct protocol factory for outbound connections.
     Notably, this factory supports only *one* protocol instance at a time.
     """
@@ -533,9 +542,9 @@ class OnionMessageChannel(MessageChannel):
                 # it'll fire the `setup_error_callback`.
                 self.hs.start_tor()
 
-            # This will serve as our unique identifier, indicating
-            # that we are ready to communicate (in both directions) over Tor.
-            self.onion_hostname = None
+                # This will serve as our unique identifier, indicating
+                # that we are ready to communicate (in both directions) over Tor.
+                self.onion_hostname = None
         else:
             # dummy 'hostname' to indicate we can start running immediately:
             self.onion_hostname = NOT_SERVING_ONION_HOSTNAME
