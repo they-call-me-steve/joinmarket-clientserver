@@ -157,7 +157,7 @@ socks5 = false
 #socks5_host = localhost
 #socks5_port = 9050
 
-[MESSAGING:onion1]
+[MESSAGING:onion]
 # onion based message channels must have the exact type 'onion'
 # (while the section name above can be MESSAGING:whatever), and there must
 # be only ONE such message channel configured (note the directory servers
@@ -551,71 +551,64 @@ def get_mchannels(mode="TAKER"):
         return _get_irc_mchannels_old()
 
     SECTION_NAME += ':'
-    sections = []
-    for s in jm_single().config.sections():
-        if s.startswith(SECTION_NAME):
-            sections.append(s)
-    assert sections
 
     irc_fields = [("host", str), ("port", int), ("channel", str), ("usessl", str),
-              ("socks5", str), ("socks5_host", str), ("socks5_port", str)]
+              ("socks5", str), ("socks5_host", str), ("socks5_port", int)]
     onion_fields = [("type", str), ("directory_nodes", str), ("regtest_count", str),
                     ("socks5_host", str), ("socks5_port", int),
                     ("tor_control_host", str), ("tor_control_port", int),
                     ("onion_serving_host", str), ("onion_serving_port", int),
                     ("hidden_service_dir", str)]
 
-    configs = []
-
-    # processing the IRC sections:
-    for section in sections:
-        if jm_single().config.has_option(section, "type"):
-            # legacy IRC configs do not have "type" but just
-            # in case, we'll allow the "irc" type:
-            if not jm_single().config.get(section, "type").lower(
-                ) == "irc":
-                break
+    def get_irc_section(s):
         server_data = {}
-
         # check if socks5 is enabled for tor and load relevant config if so
         try:
-            server_data["socks5"] = jm_single().config.get(section, "socks5")
+            server_data["socks5"] = jm_single().config.get(s, "socks5")
         except NoOptionError:
             server_data["socks5"] = "false"
         if server_data["socks5"].lower() == 'true':
-            server_data["socks5_host"] = jm_single().config.get(section, "socks5_host")
-            server_data["socks5_port"] = jm_single().config.get(section, "socks5_port")
+            server_data["socks5_host"] = jm_single().config.get(s, "socks5_host")
+            server_data["socks5_port"] = jm_single().config.get(s, "socks5_port")
 
         for option, otype in irc_fields:
-            val = jm_single().config.get(section, option)
+            val = jm_single().config.get(s, option)
             server_data[option] = otype(val)
         server_data['btcnet'] = get_network()
-        configs.append(server_data)
+        return server_data
 
-    # processing the onion sections:
-    for section in sections:
-        if not jm_single().config.has_option(section, "type") or \
-        not jm_single().config.get(section, "type").lower() == "onion":
-            continue
+    def get_onion_section(s):
         onion_data = {}
         for option, otype in onion_fields:
             try:
-                val = jm_single().config.get(section, option)
+                val = jm_single().config.get(s, option)
             except NoOptionError:
                 continue
             onion_data[option] = otype(val)
         # the onion messaging section must specify whether
         # to serve an onion:
-        if mode == "MAKER":
-            onion_data["serving"] = True
-        else:
-            onion_data["serving"] = False
+        onion_data["serving"] = mode == "MAKER"
         onion_data['btcnet'] = get_network()
         # Just to allow a dynamic set of var:
-        onion_data["section-name"] = section
-        configs.append(onion_data)
+        onion_data["section-name"] = s
+        return onion_data
 
-    return configs
+    onion_sections = []
+    irc_sections = []
+    for section in jm_single().config.sections():
+        if not section.startswith(SECTION_NAME):
+            continue
+        if jm_single().config.has_option(section, "type"):
+            channel_type = jm_single().config.get(section, "type").lower()
+            if channel_type == "onion":
+                onion_sections.append(get_onion_section(section))
+            elif channel_type == "irc":
+                irc_sections.append(get_irc_section(section))
+        else:
+            irc_sections.append(get_irc_section(section))
+    assert irc_sections or onion_sections
+    assert len(onion_sections) < 2
+    return irc_sections + onion_sections
 
 def _get_irc_mchannels_old():
     fields = [("host", str), ("port", int), ("channel", str), ("usessl", str),
@@ -806,11 +799,6 @@ def load_program_config(config_path="", bs=None, plugin_services=[]):
             if not os.path.exists(plogsdir):
                 os.makedirs(plogsdir)
             p.set_log_dir(plogsdir)
-    # Check if a onion message channel was configured, and if so,
-    # check there is only 1; multiple directory nodes will be inside the config.
-    chans = get_mchannels()
-    onion_chans = [x for x in chans if "type" in x and x["type"] == "onion"]
-    assert len(onion_chans) < 2
 
 def load_test_config(**kwargs):
     if "config_path" not in kwargs:

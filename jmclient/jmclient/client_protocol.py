@@ -434,7 +434,7 @@ class JMMakerClientProtocol(JMClientProtocol):
                                                    "blockchain_source")
         #needed only for channel naming convention
         network = jm_single().config.get("BLOCKCHAIN", "network")
-        irc_configs = self.factory.get_mchannels(mode="MAKER")
+        chan_configs = self.factory.get_mchannels(mode="MAKER")
         #only here because Init message uses this field; not used by makers TODO
         minmakers = jm_single().config.getint("POLICY", "minimum_makers")
         maker_timeout_sec = jm_single().maker_timeout_sec
@@ -442,7 +442,7 @@ class JMMakerClientProtocol(JMClientProtocol):
         d = self.callRemote(commands.JMInit,
                             bcsource=blockchain_source,
                             network=network,
-                            irc_configs=irc_configs,
+                            chan_configs=chan_configs,
                             minmakers=minmakers,
                             maker_timeout_sec=maker_timeout_sec,
                             dust_threshold=jm_single().DUST_THRESHOLD)
@@ -600,7 +600,7 @@ class JMTakerClientProtocol(JMClientProtocol):
                                                    "blockchain_source")
         #needed only for channel naming convention
         network = jm_single().config.get("BLOCKCHAIN", "network")
-        irc_configs = self.factory.get_mchannels(mode="TAKER")
+        chan_configs = self.factory.get_mchannels(mode="TAKER")
         minmakers = jm_single().config.getint("POLICY", "minimum_makers")
         maker_timeout_sec = jm_single().maker_timeout_sec
 
@@ -613,7 +613,7 @@ class JMTakerClientProtocol(JMClientProtocol):
         d = self.callRemote(commands.JMInit,
                             bcsource=blockchain_source,
                             network=network,
-                            irc_configs=irc_configs,
+                            chan_configs=chan_configs,
                             minmakers=minmakers,
                             maker_timeout_sec=maker_timeout_sec,
                             dust_threshold=jm_single().DUST_THRESHOLD)

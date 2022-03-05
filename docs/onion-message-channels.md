@@ -84,7 +84,7 @@ In short, yes.
 
 ### Do I need to configure Tor, and if so, how?
 
-To make outbound tor connections to other onions in the network, you will need to configure the
+To make outbound Tor connections to other onions in the network, you will need to configure the
 SOCKS5 proxy settings (so, only directory nodes may *not* need this; everyone else does).
 This is identical to what we already do for IRC, except that in this case, we disallow clearnet connections.
 
@@ -92,7 +92,7 @@ This is identical to what we already do for IRC, except that in this case, we di
 
 A maker will additionally allow *inbound* connections to an onion service.
 This onion service will be ephemeral, that is, it will have a different onion address every time
-you restart. This should work automatically, using your existing tor daemon (here, we are using
+you restart. This should work automatically, using your existing Tor daemon (here, we are using
 the same code as we use when running the `receive-payjoin` script, essentially).
 
 #### Running/testing as other bots (taker)
@@ -101,7 +101,7 @@ A taker will not attempt to serve an onion; it will only use outbound connection
 nodes and then, as according to need, to individual makers, also.
 
 As previously mentioned, both of these features - inbound and outbound, to onion, Tor connections - were already in use in Joinmarket. If you want to run/test as a maker bot, but never served an onion service before, it should work fine as long as you have the Tor service running in the background,
-and the default control port 9051 (if not, change that value in the `joinmarket.cfg`, see above.
+and the default control port 9051 (if not, change that value in the `joinmarket.cfg`, see above).
 
 #### Why not use Lightning based onions?
 
@@ -156,7 +156,7 @@ Add `hidden_service_dir` to your `[MESSAGING:onion1]` with a directory accessibl
 a bit!
 The point to understand is: Joinmarket's `jmbase.JMHiddenService` will, if configured with a non-empty `hidden_service_dir`
 field, actually start an *independent* instance of Tor specifically for serving this, under the current user.
-(our tor interface library `txtorcon` needs read access to the Tor HS dir, so it's troublesome to do this another way).
+(our Tor interface library `txtorcon` needs read access to the Tor HS dir, so it's troublesome to do this another way).
 
 ##### Question: How to configure the `directory-nodes` list in our `joinmarket.cfg` for this directory node bot?
 

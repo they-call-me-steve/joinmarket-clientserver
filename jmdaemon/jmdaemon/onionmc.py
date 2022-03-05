@@ -15,18 +15,8 @@ log = get_log()
 
 NOT_SERVING_ONION_HOSTNAME = "NOT-SERVING-ONION"
 
-def location_tuple_to_str(t: Tuple[str, int]):
-    return t[0] + ":" + str(t[1])
-
-def is_non_serving_location(l: str):
-    return l == NOT_SERVING_ONION_HOSTNAME
-
-def is_local_location(l: str) -> bool:
-    try:
-        a, b = l.split(":")
-    except:
-        return False
-    return a in ["localhost", "127.0.0.1"]
+def location_tuple_to_str(t: Tuple[str, int]) -> str:
+    return f"{t[0]}:{t[1]}"
 
 def network_addr_to_string(location: Union[IPv4Address, IPv4Address]) -> str:
     if isinstance(location, (IPv4Address, IPv6Address)):
@@ -35,17 +25,17 @@ def network_addr_to_string(location: Union[IPv4Address, IPv4Address]) -> str:
     else:
         # TODO handle other addr types
         assert False
-    return host + ":" + str(port)
+    return location_tuple_to_str((host, port))
 
 # module-level var to control whether we use Tor or not
-# (specifically for tests):
+# (specifically for tests)
 testing_mode = False
 def set_testing_mode(configdata: dict) -> None:
     """ Toggles testing mode which enables non-Tor
     network setup:
     """
     global testing_mode
-    if not "regtest_count" in configdata:
+    if "regtest_count" not in configdata:
         log.debug("Onion message channel is not using regtest mode.")
         testing_mode = False
         return
@@ -55,7 +45,7 @@ def set_testing_mode(configdata: dict) -> None:
         log.info("Failed to get regtest count settings, error: {}".format(repr(e)))
         testing_mode = False
         return
-    if s == 0 and e == 0:
+    if s == e == 0:
         testing_mode = False
         return
     testing_mode = True
@@ -121,13 +111,13 @@ class OnionCustomMessage(object):
         self.text = text
         self.msgtype = msgtype
 
-    def encode(self) -> str:
+    def encode(self) -> bytes:
         self.encoded = json.dumps({"type": self.msgtype,
                         "line": self.text}).encode("utf-8")
         return self.encoded
 
     @classmethod
-    def from_string_decode(cls, msg: str) -> 'OnionCustomMessage':
+    def from_string_decode(cls, msg: bytes) -> 'OnionCustomMessage':
         """ Build a custom message from a json-ified string.
         """
         try:
@@ -153,7 +143,7 @@ class OnionLineProtocol(basic.LineReceiver):
     def connectionLost(self, reason):
         self.factory.register_disconnection(self)
 
-    def lineReceived(self, line: str) -> None:
+    def lineReceived(self, line: bytes) -> None:
         try:
             msg = OnionCustomMessage.from_string_decode(line)
         except OnionCustomMessageDecodingError:
@@ -186,10 +176,10 @@ class OnionLineProtocolFactory(protocol.ServerFactory):
 
     def register_disconnection(self, p: OnionLineProtocol) -> None:
         # make a local control message registering
-        # the new connection
+        # the disconnection
         peer_location = network_addr_to_string(p.transport.getPeer())
         self.client.register_disconnection(peer_location)
-        if not peer_location in self.peers:
+        if peer_location not in self.peers:
             log.warn("Disconnection event registered for non-existent peer.")
             return
         del self.peers[peer_location]
@@ -200,7 +190,7 @@ class OnionLineProtocolFactory(protocol.ServerFactory):
             p.transport.getPeer()))
 
     def send(self, message: OnionCustomMessage, destination: str) -> bool:
-        if not (destination in self.peers):
+        if destination not in self.peers:
             log.warn("sending message {}, destination {} was not in peers {}".format(
                 message.encode(), destination, self.peers))
             return False
@@ -235,6 +225,9 @@ class OnionClientFactory(protocol.ClientFactory):
 
     def send(self, msg: OnionCustomMessage) -> bool:
         self.proto_client.message(msg)
+        # Unlike the serving protocol, the client protocol
+        # is never in a condition of not knowing the counterparty
+        return True
 
     def receive_message(self, message: OnionCustomMessage,
                         p: OnionLineProtocol) -> None:
@@ -258,7 +251,7 @@ class OnionPeer(object):
         # remote net config:
         self.hostname = location_tuple[0]
         self.port = location_tuple[1]
-        if directory and not (self.hostname):
+        if directory and not self.hostname:
             raise OnionPeerDirectoryWithoutHostError()
         self.directory = directory
         self._status = PEER_STATUS_UNCONNECTED
@@ -276,7 +269,7 @@ class OnionPeer(object):
         # on a connection created towards them).
         self.alternate_location = ""
 
-    def set_alternate_location(self, location_string: str):
+    def set_alternate_location(self, location_string: str) -> None:
         self.alternate_location = location_string
 
     def update_status(self, destn_status: int) -> None:
@@ -287,8 +280,7 @@ class OnionPeer(object):
         assert destn_status in range(4)
         ignored_updates = []
         if self._status == PEER_STATUS_UNCONNECTED:
-            allowed_updates = [PEER_STATUS_CONNECTED,
-                               PEER_STATUS_DISCONNECTED]
+            allowed_updates = [PEER_STATUS_CONNECTED]
         elif self._status == PEER_STATUS_CONNECTED:
             # updates from connected->connected are harmless
             allowed_updates = [PEER_STATUS_CONNECTED,
@@ -349,13 +341,17 @@ class OnionPeer(object):
         """ Allows setting location from an unchecked
         input string argument.
         If the location is specified as the 'no serving' case,
-        we do nothing here (i.e. preserve the existing local
-        inbound connection), and return True.
+        we put the currently existing inbound connection as the alternate
+        location, and the NOT_SERVING const as the 'location', returning True.
         If the string does not have the required format, will return False,
         otherwise self.hostname, self.port are
         updated for future `peer_location` calls, and True is returned.
         """
         if location_string == NOT_SERVING_ONION_HOSTNAME:
+            self.set_alternate_location(location_tuple_to_str(
+                (self.hostname, self.port)))
+            self.hostname = NOT_SERVING_ONION_HOSTNAME
+            self.port = -1
             return True
         try:
             host, port = location_string.split(":")
@@ -376,7 +372,7 @@ class OnionPeer(object):
             return NOT_SERVING_ONION_HOSTNAME
         # in every other case we need a sensible port/host combo:
         assert (self.port > 0 and self.hostname)
-        return self.hostname + ":" + str(self.port)
+        return location_tuple_to_str((self.hostname, self.port))
 
     def send(self, message: OnionCustomMessage) -> bool:
         """ If the message can be sent on either an inbound or
@@ -451,7 +447,7 @@ class OnionPeer(object):
         d.addErrback(log.warn, "Failed to disconnect from peer {}.".format(
             self.peer_location()))
 
-    def complete_disconnection(self):
+    def complete_disconnection(self) -> None:
         log.debug("Disconnected from peer: {}".format(self.peer_location()))
         self.update_status(PEER_STATUS_DISCONNECTED)
         self.factory = None
@@ -493,18 +489,15 @@ class OnionMessageChannel(MessageChannel):
         # TODO investigate, but for now, treat onion-based as one "server".
         self.hostid = "onion-network"
         self.tor_control_host = configdata["tor_control_host"]
-        self.tor_control_port = int(configdata["tor_control_port"])
+        self.tor_control_port = configdata["tor_control_port"]
         self.onion_serving_host=configdata["onion_serving_host"]
-        if configdata["serving"]:
-            self.onion_serving = True
-        else:
-            self.onion_serving = False
+        self.onion_serving = configdata["serving"]
         if self.onion_serving:
-            self.onion_serving_port = int(configdata["onion_serving_port"])
+            self.onion_serving_port = configdata["onion_serving_port"]
             self.hidden_service_dir = configdata["hidden_service_dir"]
         # client side config:
-        self.socks5_host = "127.0.0.1"
-        self.socks5_port = 9050
+        self.socks5_host = configdata["socks5_host"]
+        self.socks5_port = configdata["socks5_port"]
         # we use the setting in the config sent over from
         # the client, to decide whether to set up our connections
         # over localhost (if testing), without Tor:
@@ -559,16 +552,16 @@ class OnionMessageChannel(MessageChannel):
         # the rpc connection calls are not using twisted)
         self.wait_for_directories_loop = None
 
-    def info_callback(self, msg):
+    def info_callback(self, msg: str) -> None:
         log.info(msg)
 
-    def setup_error_callback(self, msg):
+    def setup_error_callback(self, msg: str) -> None:
         log.error(msg)
 
-    def shutdown_callback(self, msg):
+    def shutdown_callback(self, msg: str) -> None:
         log.info("in shutdown callback: {}".format(msg))
 
-    def onion_hostname_callback(self, hostname):
+    def onion_hostname_callback(self, hostname: str) -> None:
         """ This entrypoint marks the start of the OnionMessageChannel
         running, since we need this unique identifier as our name
         before we can start working (we need to compare it with the
@@ -592,7 +585,7 @@ class OnionMessageChannel(MessageChannel):
         return nick + COMMAND_PREFIX + "PUBLIC" + msg
  
     def get_privmsg(self, nick: str, cmd: str, message: str,
-                    source_nick=None) -> None:
+                    source_nick=None) -> str:
         """ See `get_pubmsg` for comment on `source_nick`.
         """
         from_nick = source_nick if source_nick else self.nick
@@ -627,7 +620,7 @@ class OnionMessageChannel(MessageChannel):
         encoded_privmsg = OnionCustomMessage(self.get_privmsg(nick, cmd, msg),
                             JM_MESSAGE_TYPES["privmsg"])
         peer = self.get_peer_by_nick(nick)
-        if not peer or not peer.status() == PEER_STATUS_HANDSHAKED:
+        if not peer or peer.status() != PEER_STATUS_HANDSHAKED:
             # If we are trying to message a peer via their nick, we
             # may not yet have a connection; then we just
             # forward via directory nodes.
@@ -648,7 +641,7 @@ class OnionMessageChannel(MessageChannel):
 
 # End ABC implementation section
 
-    def check_onion_hostname(self):
+    def check_onion_hostname(self) -> None:
         if not self.onion_hostname:
             return
         self.hs_up_loop.stop()
@@ -661,7 +654,7 @@ class OnionMessageChannel(MessageChannel):
         # start sending us messages.
         reactor.callLater(0.0, self.connect_to_directories)
 
-    def get_my_location_tuple(self):
+    def get_my_location_tuple(self) -> Tuple[str, int]:
         if self.onion_hostname == NOT_SERVING_ONION_HOSTNAME:
             return (self.onion_hostname, -1)
         elif testing_mode:
@@ -675,7 +668,7 @@ class OnionMessageChannel(MessageChannel):
         """
         dps = self.get_directory_peers()
         self_dir = False
-        # only for publically exposed onion does the 'virtual port' exist;
+        # only for publicly exposed onion does the 'virtual port' exist;
         # for local tests we always connect to an actual machine port:
         my_location_tuple = self.get_my_location_tuple()
         my_location_str = location_tuple_to_str(my_location_tuple)
@@ -722,16 +715,18 @@ class OnionMessageChannel(MessageChannel):
         our_hs = copy.deepcopy(client_handshake_json)
         our_hs["location-string"] = self.self_as_peer.peer_location()
         our_hs["nick"] = self.nick
+        our_hs_json = json.dumps(our_hs)
         log.info("Sending this handshake: {} to peer {}".format(
-            json.dumps(our_hs), peer.peer_location()))
-        self._send(peer, OnionCustomMessage(json.dumps(our_hs),
+            our_hs_json, peer.peer_location()))
+        self._send(peer, OnionCustomMessage(our_hs_json,
                                     CONTROL_MESSAGE_TYPES["handshake"]))
 
     def handshake_as_directory(self, peer: OnionPeer, our_hs: dict) -> None:
         assert peer.status() == PEER_STATUS_CONNECTED
+        our_hs_json = json.dumps(our_hs)
         log.info("Sending this handshake as directory: {}".format(
-            json.dumps(our_hs)))
-        self._send(peer, OnionCustomMessage(json.dumps(our_hs),
+            our_hs_json))
+        self._send(peer, OnionCustomMessage(our_hs_json,
                     CONTROL_MESSAGE_TYPES["dn-handshake"]))
 
     def get_directory_peers(self) -> list:
@@ -741,7 +736,6 @@ class OnionMessageChannel(MessageChannel):
         for p in self.get_all_connected_peers():
             if p.nick == nick:
                 return p
-        return None
 
     def _send(self, peer: OnionPeer, message: OnionCustomMessage) -> bool:
         try:
@@ -783,7 +777,7 @@ class OnionMessageChannel(MessageChannel):
             return
 
         # ignore non-JM messages:
-        if not msgtype in JM_MESSAGE_TYPES.values():
+        if msgtype not in JM_MESSAGE_TYPES.values():
             log.debug("Invalid message type, ignoring: {}".format(msgtype))
             return
 
@@ -806,9 +800,8 @@ class OnionMessageChannel(MessageChannel):
             else:
                 self.on_privmsg(from_nick, msg)
         except Exception as e:
-            log.debug("Invalid joinmarket message: {}, error was: {}".format(
+            log.debug("Invalid Joinmarket message: {}, error was: {}".format(
                 msgval, repr(e)))
-            return
 
     def forward_pubmsg_to_peers(self, msg: str, from_nick: str) -> None:
         """ Used by directory nodes currently. Takes a received
@@ -844,8 +837,9 @@ class OnionMessageChannel(MessageChannel):
             return
         # The `message` passed in has format COMMAND_PREFIX||command||" "||msg
         # we need to parse out cmd, message for sending.
-        _, cmdmsg = message.split(COMMAND_PREFIX)
-        cmdmsglist = cmdmsg.split(" ")
+        # second argument for split means only one split allowed.
+        cmdsmsgs = message.split(COMMAND_PREFIX, 1)[1]
+        cmdmsglist = cmdsmsgs.split(" ")
         cmd = cmdmsglist[0]
         msg = " ".join(cmdmsglist[1:])
         privmsg = self.get_privmsg(nick, cmd, msg, source_nick=from_nick)
@@ -865,6 +859,9 @@ class OnionMessageChannel(MessageChannel):
         """ Triggered by a directory node feeding us
         peers, or by a connect/disconnect hook; this is our housekeeping
         to try to create, and keep track of, useful connections.
+        The returned boolean indicates whether we succeeded in processing
+        the message or whether it must be analyzed again (note e.g. that
+        we return True for a rejected message!)
         """
         all_ctrl = list(LOCAL_CONTROL_MESSAGE_TYPES.values(
             )) + list(CONTROL_MESSAGE_TYPES.values())
@@ -876,9 +873,12 @@ class OnionMessageChannel(MessageChannel):
         #log.debug("received control message: {},{}".format(msgtype, msgval))
         if msgtype == CONTROL_MESSAGE_TYPES["peerlist"]:
             # This is the base method of seeding connections;
-            # a directory node can send this any time. We may well
-            # need to control this; for now it just gets processed,
-            # whereever it came from:
+            # a directory node can send this any time.
+            # These messages can only be accepted from directory peers
+            # (which we have configured ourselves):
+            peer = self.get_peer_by_id(peerid)
+            if not peer or not peer.directory:
+                return True
             try:
                 peerlist = msgval.split(",")
                 for peer in peerlist:
@@ -888,25 +888,14 @@ class OnionMessageChannel(MessageChannel):
             except Exception as e:
                 log.debug("Incorrectly formatted peer list: {}, "
                       "ignoring, {}".format(msgval, e))
-                # returning True either way, because although it was an
-                # invalid message, it *was* a control message, and should
-                # not be processed as something else.
+            # returning True whether raised or not - see docstring
             return True
         elif msgtype == CONTROL_MESSAGE_TYPES["getpeerlist"]:
-            # getpeerlist must be accompanied by a full node
-            # locator, and nick;
-            # add that peer before returning our peer list.
-            p = self.add_peer(msgval, connection=True,
-                              overwrite_connection=True, with_nick=True)
-            try:
-                self.send_peers(p)
-            except OnionPeerConnectionError:
-                pass
-            # comment much as above; if we can't connect, it's none
-            # of our business.
+            log.warn("getpeerlist request received, currently not supported.")
             return True
         elif msgtype == CONTROL_MESSAGE_TYPES["handshake"]:
-            # sent by non-directory peers on startup
+            # sent by non-directory peers on startup, also to
+            # other non-dn peers during tx flow
             self.process_handshake(peerid, msgval)
             return True
         elif msgtype == CONTROL_MESSAGE_TYPES["dn-handshake"]:
@@ -1014,7 +1003,8 @@ class OnionMessageChannel(MessageChannel):
                 log.warn("(not dn) Invalid handshake message from: {}, "
                          "exception: {}, message: {}, ignoring".format(
                              peerid, repr(e), message))
-                accepted = False
+                # just ignore, since a syntax failure could lead to a crash
+                return
             if not (app_name == JM_APP_NAME and proto_ver == JM_VERSION \
                     and not is_directory):
                 log.warn("Invalid handshake name/version data: {}, from peer: "
@@ -1027,7 +1017,7 @@ class OnionMessageChannel(MessageChannel):
             # nothing here:
             if not peer.set_location(full_location_string):
                 accepted = False
-            if not peerid == full_location_string:
+            if peerid != full_location_string:
                 peer.set_alternate_location(peerid)
             peer.set_nick(nick)
             # client peer's handshake message was valid; send ours, and
@@ -1047,8 +1037,10 @@ class OnionMessageChannel(MessageChannel):
         if p == "00":
             return self.self_as_peer
         for x in self.peers:
-            if x.peer_location() == p:
+            if x.peer_location() == p and p != NOT_SERVING_ONION_HOSTNAME:
                 return x
+            # non-reachable peers can only match on their inbound
+            # connection port
             if x.alternate_location == p:
                 return x
         return False
@@ -1075,7 +1067,7 @@ class OnionMessageChannel(MessageChannel):
         self.receive_msg(msg, "00")
 
     def add_peer(self, peerdata: str, connection: bool=False,
-                overwrite_connection: bool=False, with_nick=False) -> None:
+                overwrite_connection: bool=False, with_nick=False) -> Union[OnionPeer, None]:
         """ add non-directory peer from (nick, peer) serialization `peerdata`,
         where "peer" is host:port;
         return the created OnionPeer object. Or, with_nick=False means
@@ -1117,7 +1109,8 @@ class OnionMessageChannel(MessageChannel):
                 log.info("Updating status of peer: {} to connected.".format(temp_p.peer_location()))
                 temp_p.update_status(PEER_STATUS_CONNECTED)
             else:
-                temp_p.update_status(PEER_STATUS_DISCONNECTED)
+                if overwrite_connection:
+                    temp_p.update_status(PEER_STATUS_DISCONNECTED)
             if with_nick:
                 temp_p.set_nick(nick)
             self.peers.add(temp_p)
@@ -1186,20 +1179,21 @@ class OnionMessageChannel(MessageChannel):
             raise OnionPeerConnectionError(
                 "Cannot send peer list to unhandshaked peer")
         peerlist = set()
+        peer_filter_exists = len(peer_filter) > 0
         for p in self.get_connected_nondirectory_peers():
             # don't send a peer to itself
             if p == requesting_peer:
                 continue
-            if len(peer_filter) > 0 and p not in peer_filter:
+            if peer_filter_exists and p not in peer_filter:
                 continue
-            if not p.status() == PEER_STATUS_HANDSHAKED:
+            if p.status() != PEER_STATUS_HANDSHAKED:
                 # don't advertise what is not online.
                 continue
             # peers that haven't sent their nick yet are not
             # privmsg-reachable; don't send them
             if p.nick == "":
                 continue
-            if is_local_location(p.peer_location()):
+            if p.peer_location() == NOT_SERVING_ONION_HOSTNAME:
                 # if a connection has no reachable destination,
                 # don't forward it
                 continue
